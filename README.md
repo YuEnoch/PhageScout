@@ -2,7 +2,9 @@
 
 Substrate phage display analysis for **cathepsin G** and **elastase**: cleavage preferences from SPD screens are combined with AlphaFold structural features to score and predict MEROPS cleavage sites.
 
-## Analysis
+Please refer to https://github.com/YuEnoch/ProteaseProfiling for steps on turning the sequencing data into the neutrophil_serine_protease_data.csv (input file for R script)
+
+## R Analysis
 
 Main notebook: [`PhageScout_code.Rmd`](PhageScout_code.Rmd)
 
