@@ -1,0 +1,3279 @@
+---
+title: "PhageScout Code: Cathepsin G & Elastase Cleavage Prediction"
+author: "Enoch Yu"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.path = "figures/",
+  fig.align = "center",
+  dpi = 150,
+  dev = "png"
+)
+dir.create("figures", showWarnings = FALSE, recursive = TRUE)
+
+save_fig <- function(plot_obj, name, width = 10, height = 6, dpi = 150) {
+  path <- file.path("figures", paste0(name, ".png"))
+  ggplot2::ggsave(
+    filename = path,
+    plot = plot_obj,
+    width = width,
+    height = height,
+    dpi = dpi,
+    bg = "white"
+  )
+  knitr::include_graphics(path)
+}
+
+save_base_fig <- function(name, width = 8, height = 5) {
+  path <- file.path("figures", paste0(name, ".png"))
+  grDevices::dev.copy(grDevices::png, filename = path, width = width, height = height, units = "in", res = 150)
+  grDevices::dev.off()
+  knitr::include_graphics(path)
+}
+```
+# Introduction
+
+This notebook analyzes substrate phage display (SPD) screens of cathepsin G and elastase, then uses the resulting cleavage preferences—together with AlphaFold structural features—to score and predict MEROPS cleavage sites.
+
+## Experimental overview
+
+We constructed a 5-amino acid substrate phage display library of randomized 5-mers, with a FLAG tag immobilized onto anti-FLAG beads. The phage library was screened against two neutrophil serine proteases (cathepsin G and elastase) along with controls: no protease (baseline phage release) and the unselected phage library (FLAG peptide elution). All conditions were run in triplicate.
+
+Post-incubation, cleaved phages were collected. DNA was isolated, purified, PCR-amplified (2 rounds), and sequenced on Illumina NextSeq2000. Read assembly, quality filtering, and peptide translation followed: https://github.com/YuEnoch/ProteaseProfiling
+
+## Analysis overview
+
+1. Library composition of the unselected (FLAG) phage pool.
+2. DESeq2 enrichment of cleaved peptides vs FLAG (Appendix S3–S4).
+3. Position weight matrices and peptide profiles from DESeq2 and significantly cleaved sets, with and without DECIPHER alignment (Appendix S5).
+4. Mapping of MEROPS cleavage sites onto AlphaFold models (Appendix S1–S2).
+5. Scoring of all candidate cut sites with phage PWMs / peptide profiles, structural annotation, and null PWM tests (Appendix S6–S10, S15).
+6. Binary XGBoost classifiers (one per protease) that combine sequence scores and structure to recover known cut sites (Appendix S11–S14, S16–S18).
+
+### Supplementary figures
+
+| Appendix | Description |
+|----------|-------------|
+| S1 | Identified MEROPS substrates and cut sites for cathepsin G (164 substrates, 265 sites; 47 physiological / 217 non-physiological) and elastase (188 / 347; 125 / 219); union 270 substrates, 581 sites |
+| S2 | Sequence logos of MEROPS specificities: (A) all substrates; (B) physiological substrates only |
+| S3 | Peptide counts from SPD: 652,509 peptides screened; significantly cleaved sets (log2FC > 1, padj < 10^-3) of 9,577 (cathepsin G) and 8,364 (elastase) |
+| S4 | Distributions of peptide enrichment for all peptides vs significantly cleaved peptides |
+| S5 | PWMs: (A–B) all peptides weighted by log2 fold-change; (B) significantly cleaved peptides; (C–E) unsupervised DECIPHER alignment into 9-mer space |
+| S6 | Distributions of phage-derived cut scores (normalized 0–1) across all possible sites, using PWM-based or peptide-match scoring |
+| S7 | Phage cut scores at known physiological cut sites vs all other sites on the same proteins |
+| S8 | As S7, split by physiological vs non-physiological MEROPS sites |
+| S9 | As S7, split by secondary structure at the cut |
+| S10 | Phage-derived PWMs vs 10,000 randomly generated PWMs (percentiles labeled) |
+| S11–S12 | Classification performance on a balanced 1:1 MEROPS:random set (cathepsin G / elastase) |
+| S13–S14 | Classification performance across all possible cut sites on ~273 substrates (cathepsin G / elastase) |
+| S15 | Percentiles of structural and phage-derived features at known cuts vs background |
+| S16 | XGBoost feature importance (balanced training) |
+| S17–S18 | XGBoost models trained on the full cut-site landscape (cathepsin G / elastase) |
+
+Library construction and screening design:
+
+```{r fig-library-design, echo=FALSE,out.width="40%", out.height="20%",fig.cap="Phage library generation and experimental design",fig.show='hold',fig.align='center'}
+knitr::include_graphics("phagelibraryprep.png")
+```
+
+# Setup
+
+The compiled cleaved peptide counts were merged for the neutrophil protease screens (with a row-sum filter of 6). All files are available as supplementary data files in the manuscript.
+
+### Opening files
+
+Read counts are stored in `neutrophil_serine_protease_data.csv` (peptide × replicate). Replicates are cathepsin G (C1–C3), elastase (E1–E3), and FLAG elution (N1–N3).
+
+```{r File Opening, warning = FALSE}
+set.seed(123)
+protease_counts <- read.csv(
+  file = "neutrophil_serine_protease_data.csv",
+  header = TRUE,
+  row.names = 1
+)
+```
+
+Experimental labels for DESeq2:
+
+```{r Data Parameters}
+proteases = c("cathepsin G","elastase")
+protease_replicates = c("C1", "C2", "C3", "E1", "E2", "E3", "N1", "N2", "N3")
+protease_col = c("cathepsin G","cathepsin G","cathepsin G" ,"elastase","elastase","elastase", "FLAG","FLAG","FLAG")
+protease_colname = c("cathepsin G 1","cathepsin G 2","cathepsin G 3","elastase 1","elastase 2","elastase 3","FLAG 1","FLAG 2","FLAG 3")
+control = "FLAG"
+
+
+```
+
+Keep only the cathepsin G, elastase, and FLAG columns used in this analysis:
+
+```{r Subset protease columns}
+protease_counts <- protease_counts[, protease_replicates, drop = FALSE]
+stopifnot(ncol(protease_counts) == length(protease_col))
+```
+
+Necessary packages were also loaded: plyr, dplyr, tidyr, RColorBrewer, bio3d, biomaRt, httr, RCurl, XML, zoo
+
+ggplot2, ggseqlogo, DESeq2, DECIPHER
+
+reshape, factoextra, stringr, openxlsx, stats, multcomp, Hmisc, gridExtra, tidyverse, ggplot2, ggseqlogo, ggpubr, ggbeeswarm, ggVennDiagram, ggVenn, pheatmap, PoiClaClu, BiocManager, S4Arrays, DelayedArray, DESeq2, DECIPHER, plotly, plot3D, dbscan, forcats, umap, immunedeconv, plotly, clusterSim
+
+Install (if needed) and load packages used below:
+
+```{r Setup1, include=FALSE, warning = FALSE, echo = FALSE}
+if(!require(plyr)){install.packages("plyr")}
+library(plyr)
+if(!require(dplyr)){install.packages("dplyr")}
+library(dplyr)
+if(!require(tidyr)){install.packages("tidyr")}
+library(tidyr)
+if(!require(RColorBrewer)){install.packages("RColorBrewer")}
+library(RColorBrewer)
+if(!require(bio3d)){install.packages("bio3d")}
+library(bio3d)
+if(!require(biomaRt)){BiocManager::install("biomaRt")}
+library(biomaRt)
+if(!require(httr)){install.packages("httr")}
+library(httr)
+if(!require(RCurl)){install.packages("RCurl")}
+library(RCurl)
+if(!require(XML)){install.packages("XML")}
+library(XML)
+if(!require(zoo)){install.packages("zoo")}
+library(zoo)
+if(!require(reshape2)){install.packages("reshape")}
+library(reshape2)
+if(!require(patchwork)){install.packages("patchwork")}
+library(patchwork)
+
+if(!require(ggplot2)){install.packages("ggplot2")}
+library(ggplot2)
+if(!require(ggseqlogo)){install.packages("ggseqlogo")}
+library(ggseqlogo)
+if(!require(ggrepel)){install.packages("ggrepel")}
+library(ggrepel)
+if(!require(scales)){install.packages("scales")}
+library(scales)
+if(!require(precrec)){install.packages("precrec")}
+library(precrec)
+
+
+if (!require("BiocManager", quietly = TRUE)){install.packages("BiocManager")}
+if(!require(DESeq2)){BiocManager::install("DESeq2")}
+library(DESeq2)
+if(!require(DECIPHER)){BiocManager::install("DECIPHER")}
+library(DECIPHER)
+if(!require(stringr)){install.packages("stringr")} 
+library(stringr)
+if(!require(pROC)){install.packages("pROC")} 
+library(pROC)
+if(!require(xgboost)){install.packages("xgboost")} 
+library(xgboost)
+
+if(!require(Matrix)){install.packages("Matrix")} 
+library(Matrix)
+if(!require(caret)){install.packages("caret")} 
+library(caret)
+if(!require(purrr)){install.packages("purrr")} 
+library(purrr)
+```
+
+# Library composition controls
+
+### Unselected (FLAG) amino-acid frequencies
+
+To assess protease matches, the frequency of the unselected phage (FLAG peptide elution) must be determined, to account for background compositional biases in the phage library. The amino acid counts of the control conditions were analyzed, normalized across triplicates. The frequency was then determined and plotted with a barplot.
+
+A list of peptides mimicking the amino acid frequencies at each position in the unselected phage library were also generated. These positional frequencies are saved and later used as the background for log-odds PWMs.
+
+```{r control-aa-frequencies, out.width="30%", eval = TRUE}
+AA = c("A", "C", "D", "E", "F", "G", "H", "I", "K", "L", "M", "N", "P", "Q", "R", "S", "T", "V", "W", "Y", "X")
+expected = c(2, 1, 1, 1, 1, 2, 1, 1, 1, 3, 1, 1, 2, 1, 3, 3, 2, 2, 1, 1, 1)
+control_frequency <- data.frame(AA, pos1 = numeric(21), pos2 = numeric(21), pos3 = numeric(21), pos4 = numeric(21), pos5 = numeric(21), expected)
+
+process_counts <- function(count_df, df_name, control, control_frequency) {
+  control_df <- count_df[, c(protease_col == control)]
+  normalized <- sweep(control_df, 2, colSums(control_df), `/`) * 1000
+  row_sums <- as.data.frame(rowSums(normalized))
+  row_sums$peptide <- row.names(row_sums)
+
+  split_data <- separate(
+    row_sums, 
+    peptide, 
+    into = c("x","P1","P2","P3","P4","P5"), 
+    sep = ""
+  )
+
+  for (i in 1:5) {
+    for (j in 1:21) {
+      filtered_data <- split_data %>% 
+        filter(!!sym(paste0("P", i)) == control_frequency[[1]][j])
+      counts_sum <- sum(filtered_data[,1], na.rm = TRUE)
+      control_frequency[j, i+1] <- counts_sum
+    }
+  }
+
+  control_frequency[, 2:6] <- control_frequency[, 2:6] * 
+                              (mean(colSums(control_df)) / 1000)
+
+  control_frequency$AA <- factor(control_frequency$AA, 
+                                 levels = control_frequency$AA)
+
+  write.table(
+    control_frequency, 
+    file = paste0("control_frequency_", df_name, ".txt"),
+    sep = "\t", 
+    row.names = FALSE, 
+    quote = FALSE
+  )
+  
+  png(file.path("figures", paste0("control_frequency_", df_name, ".png")),
+      width = 8, height = 5, units = "in", res = 150)
+  barplot(
+    t(control_frequency[, -c(1,7)]),
+    beside = TRUE,
+    col = rainbow(5),
+    legend.text = colnames(control_frequency[, -c(1,7)]),
+    args.legend = list(x = "topright", ncol = 1),
+    main = paste0("AA Positional Frequencies — ", df_name),
+    xlab = "Amino Acid",
+    ylab = "Normalized Counts",
+    names.arg = control_frequency$AA
+  )
+  dev.off()
+  knitr::include_graphics(file.path("figures", paste0("control_frequency_", df_name, ".png")))
+
+  control_frequency_df <- control_frequency
+  rownames(control_frequency_df) <- control_frequency_df[, 1]
+  control_frequency_df <- control_frequency_df[, -1]
+  control_frequency_df <- control_frequency_df[, -6]
+  rounded_df <- apply(control_frequency_df, 2, function(x) ceiling(x/10000))
+  rounded_sums <- colSums(rounded_df)
+  
+  sink_name <- paste0("control_frequency_", df_name, ".fasta")
+  sink(sink_name)
+  
+  controlList <- c()
+  
+  for (i in 1:min(rounded_sums)) {
+    peptide <- ""
+    for (j in 1:length(rounded_sums)) {
+      amino_acid_index <- which(cumsum(rounded_df[, j]) >= i)[1]
+      amino_acid <- rownames(rounded_df)[amino_acid_index]
+      peptide <- paste0(peptide, amino_acid)
+    }
+    
+    cat(">", peptide, "\n", peptide, "\n", sep = "")
+    controlList <- c(controlList, peptide)
+  }
+  
+  sink()  
+  
+  return(controlList)
+}
+freq_protease  <- process_counts(protease_counts,  "protease",  control, control_frequency)
+save_fig(ggseqlogo(freq_protease), "freq_protease_bits", width = 10, height = 4)
+save_fig(ggseqlogo(freq_protease, method = "prob"), "freq_protease_prob", width = 10, height = 4)
+
+```
+
+
+### DESeq2 Analysis
+
+We used DESeq2 for differential enrichment analysis of cleaved peptides, identifying enriched peptides relative to the unselected library (FLAG peptide elution). Peptides with a stop codon or row sum below 10 were removed.
+
+```{r Setup2, warning = FALSE, eval = FALSE, results = 'hide'}
+data_NS <- subset(protease_counts, grepl("X", row.names(protease_counts)) == FALSE)
+countData <- as.matrix(data_NS)
+colData <- data.frame(condition=factor(protease_col))
+dds=DESeqDataSetFromMatrix(countData, colData, formula(~ condition))
+dds$condition <- relevel(dds$condition, ref = "FLAG")
+keep <- rowSums(counts(dds)) >= 10
+dds_protease <- dds[keep,]
+
+dds_protease=DESeq(dds_protease)
+saveRDS(dds_protease, file = paste0("protease_dds.rds"))
+```
+
+```{r DESeq2_2, include = FALSE}
+dds_protease <- readRDS(paste0("protease_dds.rds"))
+```
+
+
+# Proteolytic profile generation
+
+To capture protease cleavage preferences, we generated either position weight matrices (PWMs) or peptide profiles. PWMs represented frequencies of each amino acid across positions, in log2 space and relative to control (the unselected phage library). Peptide profiles represented frequencies of each peptide sequence, also relative to control, and provide a more specific match than the general PWM preference.
+
+PWMs were first calculated from a position probability matrix (PPM), which were weighted by log-2 fold change or non-weighted. Log-odds PWMs were obtained using the control frequencies as a background.
+
+We generated PWMs (general positional match) based on
+1. DESeq2 Normalized Counts (no cut-off, 5-mers, weighted by fold change)
+2. Significantly cleaved peptides (unaligned, 5-mers) using Bonferroni padj < 10^-2 and log2 fold-change > 1
+3. Significantly cleaved peptides (aligned, 9-mers) using the same cutoff
+
+All peptides that met the significance threshold were weighted equally.
+
+We generated peptide profiles (full-peptide match) based on
+1. DESeq2 Normalized Counts (no cut-off, 5-mers)
+2. Significantly cleaved peptides (unaligned, 5-mers)
+3. Significantly cleaved peptides (aligned, 9-mers)
+
+
+### Read Control Frequencies
+Control Frequencies for Protease Screen: 'control_frequency_protease.txt'
+
+```{r read-control-frequencies}
+control_frequency <- read.table("control_frequency_protease.txt", header = TRUE)
+rownames(control_frequency) <- control_frequency[, 1]
+control_frequency <- control_frequency[, -1]
+control_frequency <- control_frequency[rownames(control_frequency)!="X",]
+control_frequency <- control_frequency[, -ncol(control_frequency)]
+protease_control_prob <- control_frequency/colSums(control_frequency)
+
+```
+
+### DESeq2 Normalized Counts
+
+For the DESeq2 normalized counts, we generated a PWM for each protease based on all evaluated peptides, weighted by log-2 fold change relative to the control. Separately, peptide profiles of all peptides and their log-2 fold change were made. As the control frequency was accounted in the log-2 fold change, no additional log correction was made.
+
+1. DESeq2 Normalized Counts (no cut-off, 5-mers)
+   a) weighted by log-2 fold change
+
+PWMs are written to `<protease>_deseq2_pwm.txt` (Appendix S5 A–B).
+
+```{r make-deseq2-pwms}
+make_pwm <- function(res, control_prob, condition_name) {
+  df <- as.data.frame(res)
+  
+  df$pep <- rownames(df)
+  df <- df[ nchar(df$pep) == 5 & !is.na(df$log2FoldChange) & df$log2FoldChange != 0, ]
+  n_peptides <- nrow(df)
+  df$w <- (df$log2FoldChange) 
+  seqmat <- do.call(rbind, strsplit(df$pep, ""))
+  colnames(seqmat) <- paste0("P", 1:5)
+  df <- cbind(df, seqmat)
+
+  pwm <- matrix(0, nrow=length(AA), ncol=5, dimnames=list(AA, paste0("P",1:5)))
+
+  for (pos in 1:5) {
+    aa_pos <- df[[paste0("P", pos)]]
+    for (aa in AA) {
+      pwm[aa, pos] <- sum(df$w[aa_pos == aa], na.rm=TRUE)
+    }
+  }
+  pwm <- sweep(pwm, 2, colSums(pwm), "/")
+  colnames(pwm) <- as.character(1:5)
+  pwm_output <- t(pwm)
+  pwm_output <- replace(pwm_output, is.infinite(pwm_output), 0)
+  write.table(pwm_output, file = paste0(condition_name, '_deseq2_pwm.txt'), sep = "\t", row.names = FALSE)
+
+  message(sprintf(
+    "[%s] PWM generated from %d peptides",
+    condition_name, n_peptides
+  ))
+  return(pwm)
+}
+ 
+pwm_list <- list()
+pvalthreshold = 0.01  # relaxed cutoff
+for(i in 1:length(proteases)){
+  res_prot <- results(dds_protease, contrast=c("condition",proteases[i],"FLAG"), pAdjustMethod = "bonf")
+  pwm <- make_pwm(res_prot, protease_control_prob, proteases[i])
+  pwm_list[[proteases[i]]] <- as.matrix(pwm)
+}
+```
+
+Sequence logos of the DESeq2 PWMs:
+
+```{r plot-deseq2-pwm-seqlogos, warning = FALSE}
+pwm_to_prob <- function(pwm) {
+  pwm[pwm < 0] <- 0
+  pwm <- sweep(pwm, 2, colSums(pwm), "/", check.margin = FALSE)
+  pwm[!is.finite(pwm)] <- 0
+  pwm
+}
+pwm_list_prob <- lapply(pwm_list, pwm_to_prob)
+save_fig(ggseqlogo(pwm_list), "deseq2_pwm_bits", width = 12, height = 5)
+save_fig(ggseqlogo(pwm_list_prob, method = "prob"), "deseq2_pwm_prob", width = 12, height = 5)
+
+```
+
+Heatmap plotting helper (`plot_pwms`):
+
+```{r define-plot-pwms}
+plot_pwms <- function(pwm_list, pep_len = 5, global_max = 2.5, global_min = -2.5){
+  all_vals <- unlist(lapply(pwm_list, function(x) as.numeric(t(x))))
+
+
+plot_pwm <- function(pwm, title = "", global_min, global_max, show_legend = FALSE) {
+  df <- reshape2::melt(pwm)
+  colnames(df) <- c("AA", "Position", "Value")
+  df$Position <- factor(df$Position, levels = as.character(1:pep_len))
+  if (length(unique(df$Position)) == 9) {
+    df$Position <- factor(
+    df$Position,
+    levels = 1:9,
+    labels = c("P5","P4","P3","P2","P1","P1′","P2′","P3′","P4′")
+    )
+  }
+  g<-ggplot(df, aes(x = Position, y = AA, fill = Value)) +
+    geom_tile() +
+    scale_fill_gradient2(
+      low = "blue",
+      mid = "white",
+      high = "red",
+      midpoint = 0,
+      limits = c(global_min, global_max), 
+      oob = scales::squish
+    ) +
+    theme_minimal(base_size = 10) +
+    ggtitle(title) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      plot.title = element_text(size = 12, face = "bold")
+    ) 
+  g <- g + scale_x_discrete(drop = FALSE)
+  
+  if (!show_legend) {
+    g <- g + theme(legend.position = "none")
+  }
+    return(g)
+
+}
+  n <- length(pwm_list)
+  prot_plots <- lapply(seq_len(n), function(i) {
+    plot_pwm(pwm_list[[i]], names(pwm_list)[i], global_min, global_max, show_legend = (i == n))
+  })
+  final_plot <- wrap_plots(prot_plots, nrow = 1)
+  save_fig(
+    final_plot,
+    paste0("pwm_heatmap_", gsub(" ", "_", paste(names(pwm_list), collapse = "_"))),
+    width = 10, height = 4
+  )
+
+}
+```
+DESeq2-weighted PWM heatmaps (Appendix S5 A):
+
+```{r plot-deseq2-pwm-heatmaps}
+plot_pwms(pwm_list, global_min = -1, global_max = 1)
+```
+
+
+Peptide profiles for all peptides (`peptide_profile_<protease>.txt`), used later for peptide-match scoring:
+
+```{r write-deseq2-peptide-profiles}
+get_peptide_profile <- function(res, condition_name) {
+  df <- as.data.frame(res)
+  df$peptide <- rownames(df)
+  df <- df[!is.na(df$log2FoldChange), ]
+  df$condition   <- condition_name
+  df$fold_change <- df$log2FoldChange 
+  out <- df[, c("peptide", "log2FoldChange"), drop = FALSE]
+      write.table(out, file = paste0("peptide_profile_", condition_name, ".txt"), sep = "\t", quote = FALSE, row.names = FALSE )
+  return(out)
+}
+
+for(i in 1:length(proteases)){
+  res_prot <- results(dds_protease, contrast=c("condition",proteases[i],"FLAG"), alpha=pvalthreshold,pAdjustMethod = "bonf")
+  profile <- get_peptide_profile(res_prot, proteases[i])
+}
+
+
+```
+
+### Significantly cleaved peptides
+
+Of 652,509 peptides screened, we retained those with log2 fold-change > 1 and Bonferroni-adjusted *p* < 0.01 (Appendix S3; approximately 9,577 for cathepsin G and 8,364 for elastase). Significant peptides are written to `sig_peptides_relaxed_<protease>.txt`.
+
+```{r get-sig-peptides-relaxed}
+get_sig_peptides <- function(res, pvalthreshold, log2foldthreshold) {
+  df <- as.data.frame(res)
+  df$AA_seq <- rownames(df)
+  df <- df[!is.na(df$log2FoldChange), ]
+  df <- df[order(df$pvalue), ]
+  sig <- subset(df, padj < pvalthreshold)
+  sig <- subset(sig, log2FoldChange > log2foldthreshold)
+  return(sig)
+}
+
+peptideList_relaxed <- list()
+combined <- proteases
+
+
+for (cond in combined) {
+  res <- results(dds_protease, contrast = c("condition", cond, "FLAG"), pAdjustMethod = "bonf")
+  sig <- get_sig_peptides(res, pvalthreshold = 0.01, log2foldthreshold = 1)  # relaxed
+  cat(cond, " padj<0.01: ", nrow(sig), "\n")
+  write.table(sig$AA_seq,file=paste0("sig_peptides_relaxed_", cond,".txt"),sep = "\t", col.names=FALSE, append=FALSE, quote=FALSE, row.names = FALSE)
+  peptideList_relaxed[[cond]] <- sig$AA_seq
+}
+
+```
+
+Sequence logos of significantly cleaved 5-mers:
+
+```{r plot-sig-peptide-seqlogos, out.width="60%"}
+display_sig_peptides <- function(peptideList){
+  proteases_list <- list(`cathepsin G` = peptideList$`cathepsin G`, elastase = peptideList$elastase)
+  combined_list <- proteases_list
+  save_fig(ggseqlogo(combined_list), "sig_peptides_bits", width = 12, height = 5)
+  save_fig(ggseqlogo(combined_list, method = "prob"), "sig_peptides_prob", width = 12, height = 5)
+}
+
+display_sig_peptides(peptideList_relaxed)
+
+
+```
+
+Functions to convert peptides between TXT and FASTA files:
+
+```{r txt-fasta-helpers}
+txt_to_fasta <- function(fname) {
+  AA_seqs <- scan(file=paste0(fname, ".txt"), what="", sep="\n")
+  fastaFile <- paste0(fname,".fasta")
+  fileConn<-file(fastaFile)
+  sink(fastaFile)
+  AA_seqs <- as.data.frame(AA_seqs)
+  for (i in 1:length(AA_seqs$AA_seqs)){
+    cat(paste0(">",AA_seqs$AA_seqs[i]))
+    cat("\n")
+    cat(AA_seqs$AA_seqs[i])
+    cat("\n")
+  }
+  close(fileConn)
+  sink() 
+}
+
+fasta_to_txt <- function(fname) {
+  AA_seqs <- scan(file=paste0(fname, ".fasta"), what="", sep="\n")
+  AA_seqs <- AA_seqs[!grepl(">", AA_seqs)]
+  txtFile <- paste0(fname,".txt")
+  fileConn<-file(txtFile)
+  sink(txtFile)
+  AA_seqs <- as.data.frame(AA_seqs)
+  for (i in 1:length(AA_seqs$AA_seqs)){
+    cat(AA_seqs$AA_seqs[i])
+    cat("\n")
+  }
+  close(fileConn)
+  sink() 
+}
+```
+
+### DECIPHER unsupervised alignment
+
+These significantly cleaved 5-mer peptides were subsequently aligned using the unsupervised alignment tool DECIPHER (into 9-mer space, representing 4 possible cut sites). This was to estimate the P1–P1′ cut site. The parameter `terminalGap` was adjusted to fit peptides into 9-mer space (Appendix S5 C–E). Set `eval = TRUE` to recompute alignments; otherwise use the saved FASTA/TXT outputs.
+
+```{r decipher-align-sig-peptides, eval = FALSE}
+mode = 'relaxed_'
+for(i in 1:length(combined)){
+  txt_to_fasta(paste0("sig_peptides_",mode,combined[i]))
+  fastaFile <- paste0("sig_peptides_",mode,combined[i], ".fasta")
+  seqs <- readAAStringSet(fastaFile)
+  aligned <- AlignSeqs(seqs, gapOpening = -500, useStructures = TRUE, terminalGap = -3)
+  #the parameter terminalGap was adjusted to fit 9-mer space
+  writeXStringSet(aligned,file= paste0("aligned_sig_peptides_",mode,combined[i], ".fasta"))
+  fasta_to_txt(paste0("aligned_sig_peptides_",mode,combined[i]))
+}
+```
+
+From each alignment, take the consensus-rich column as putative P1 and extract the surrounding 9-mer (±4 residues):
+
+```{r extract-aligned-9mers}
+alignedpeptideList_relaxed <- list()
+mode = 'relaxed_'
+for(i in 1:length(combined)){
+  alignedAA <- read.table(paste0("aligned_sig_peptides_",mode,combined[i], ".txt"))
+  df_aligned <- apply(alignedAA, 1, function(row) {
+     unlist(strsplit(row, ""))
+  })
+  df_aligned <- as.data.frame(t(df_aligned))
+
+  seqs <- readAAStringSet(paste0("aligned_sig_peptides_",mode,combined[i], ".fasta"))
+  consensus <- consensusMatrix(seqs, as.prob = T)
+  consensus <- consensus[rownames(consensus) != "-", ]
+  highest_col <- which.max(colSums(consensus * (consensus > 0.095)))
+  df_9mer <- df_aligned[, (highest_col-4):(highest_col+4)]
+  merged_9mer <- apply(df_9mer, 1, function(row) paste(row, collapse = ""))
+  alignedpeptideList_relaxed[combined[i]] <- list(merged_9mer)
+  write.table(merged_9mer, file = paste0("aligned_9mer_",mode, combined[i], ".txt"), quote = FALSE, row.names = FALSE, col.names = FALSE)
+  txt_to_fasta(paste0("aligned_9mer_",mode,combined[i]))
+}
+
+```
+
+Sequence logos of aligned 9-mers (P5…P4′; Appendix S5 D–E):
+
+```{r plot-aligned-sig-seqlogos}
+display_aligned_peptides <- function(alignedpeptideList){
+  proteases_aligned_list <- list(`cathepsin G` = alignedpeptideList$`cathepsin G`, elastase = alignedpeptideList$elastase)
+  combined_aligned_list <- proteases_aligned_list
+  
+  p_bits <- ggseqlogo(combined_aligned_list) + scale_x_continuous(
+    breaks = 1:9,
+    labels = c("P5", "P4", "P3", "P2", "P1", "P1′", "P2′", "P3′", "P4′")
+  )
+  p_prob <- ggseqlogo(combined_aligned_list, method = "prob") + scale_x_continuous(
+    breaks = 1:9,
+    labels = c("P5", "P4", "P3", "P2", "P1", "P1′", "P2′", "P3′", "P4′")
+  )
+  save_fig(p_bits, "aligned_sig_peptides_bits", width = 12, height = 5)
+  save_fig(p_prob, "aligned_sig_peptides_prob", width = 12, height = 5)
+}
+display_aligned_peptides(alignedpeptideList_relaxed)
+
+```
+### Unaligned PWMs (5-mer)
+
+Generation of 5-mer PWMs for significantly cleaved peptides (not aligned), relative to FLAG background frequencies (Appendix S5 B). Outputs: `<protease>_relaxed_pwm.txt`.
+
+```{r make-relaxed-5mer-pwms}
+AA <- c("A", "C", "D", "E", "F", "G", "H", "I", "K", "L",
+        "M", "N", "P", "Q", "R", "S", "T", "V", "W", "Y")
+n_aa <- length(AA)
+
+pwm_list_relaxed <- list()
+
+mode <- "relaxed_"
+peptideList <- peptideList_relaxed
+
+for (i in seq_along(combined)) {
+  sequences <- peptideList[[i]]
+  if (is.null(sequences) || length(sequences) == 0 || all(is.na(sequences))) {
+    warning("No peptides for ", combined[i], "; skipping PWM.")
+    next
+  }
+  control_prob <- protease_control_prob[AA, , drop = FALSE]
+
+  pep_len <- nchar(sequences[1])
+  AA_counts <- as.data.frame(matrix(0, nrow = pep_len, ncol = n_aa))
+  colnames(AA_counts) <- AA
+
+  for (j in seq_len(pep_len)) {
+    temp <- substr(sequences, j, j)
+    for (k in seq_len(n_aa)) {
+      AA_counts[j, k] <- sum(temp == AA[k], na.rm = TRUE)
+    }
+  }
+  AA_counts$total <- rowSums(AA_counts[, AA, drop = FALSE])
+  PPM <- AA_counts[, AA, drop = FALSE] / AA_counts$total
+  PPM <- as.data.frame(t(PPM))
+  colnames(PPM) <- as.character(seq_len(pep_len))
+
+  # Align control background to PPM rows/cols
+  control_use <- as.data.frame(control_prob)
+  if (ncol(control_use) != pep_len) {
+    # 5-mer PWM: control_prob has 5 position columns
+    control_use <- control_use[, seq_len(min(pep_len, ncol(control_use))), drop = FALSE]
+  }
+  rownames(control_use) <- AA
+  colnames(control_use) <- colnames(PPM)
+
+  pwm <- log2(PPM / control_use)
+  colnames(pwm) <- as.character(seq_len(pep_len))
+  pwm_output <- t(pwm)
+  pwm_output <- replace(pwm_output, is.infinite(as.matrix(pwm_output)), 0)
+  write.table(
+    pwm_output,
+    file = paste0(combined[i], "_", mode, "pwm.txt"),
+    sep = "\t",
+    row.names = FALSE
+  )
+
+  pwm_list_relaxed[[combined[i]]] <- as.matrix(pwm)
+}
+```
+
+
+Heatmaps of unaligned PWMs:
+
+```{r plot-relaxed-5mer-pwm-heatmaps, warning = FALSE}
+plot_pwms(pwm_list_relaxed)
+```
+
+### Aligned PWMs (9-mer)
+
+Generation of 9-mer PWMs for significantly cleaved peptides after DECIPHER alignment. Background is the mean FLAG amino-acid frequency expanded across 9 positions (Appendix S5 C). Outputs: `<protease>_relaxed_aligned_pwm.txt`.
+
+```{r make-relaxed-9mer-pwms}
+n_aa <- length(AA)
+
+protease_9control_prob <- matrix(
+  rep(rowMeans(protease_control_prob[AA, , drop = FALSE], na.rm = TRUE), each = 9),
+  nrow = n_aa, ncol = 9, byrow = TRUE,
+  dimnames = list(AA, as.character(1:9))
+)
+
+alignedpwm_list_relaxed <- list()
+mode <- "relaxed_"
+alignedpeptideList <- alignedpeptideList_relaxed
+
+for (i in seq_along(combined)) {
+  sequences <- alignedpeptideList[[i]]
+  if (is.null(sequences) || length(sequences) == 0 || all(is.na(sequences))) {
+    warning("No aligned peptides for ", combined[i], "; skipping.")
+    next
+  }
+  control_prob <- protease_9control_prob
+  pep_len <- nchar(as.character(sequences[1]))
+
+  AA_counts <- as.data.frame(matrix(0, nrow = pep_len, ncol = n_aa))
+  colnames(AA_counts) <- AA
+  for (j in seq_len(pep_len)) {
+    temp <- substr(sequences, j, j)
+    for (k in seq_len(n_aa)) {
+      AA_counts[j, k] <- sum(temp == AA[k], na.rm = TRUE)
+    }
+  }
+  AA_counts$total <- rowSums(AA_counts[, AA, drop = FALSE])
+  PPM <- AA_counts[, AA, drop = FALSE] / AA_counts$total
+  PPM <- as.data.frame(t(PPM))
+  colnames(PPM) <- as.character(seq_len(pep_len))
+
+  pwm <- log2(PPM / as.data.frame(control_prob)[, seq_len(pep_len), drop = FALSE])
+  colnames(pwm) <- as.character(seq_len(pep_len))
+  pwm_output <- t(pwm)
+  pwm_output <- replace(pwm_output, is.infinite(as.matrix(pwm_output)), 0)
+  write.table(
+    pwm_output,
+    file = paste0(combined[i], "_", mode, "aligned_pwm.txt"),
+    sep = "\t",
+    row.names = FALSE
+  )
+  alignedpwm_list_relaxed[[combined[i]]] <- as.matrix(t(pwm_output))
+}
+```
+
+Heatmaps of aligned PWMs:
+
+```{r plot-relaxed-9mer-pwm-heatmaps}
+plot_pwms(alignedpwm_list_relaxed, pep_len = 9)
+```
+
+
+### Peptide profiles for significantly cleaved sets
+
+Peptide profiles of cleaved peptides
+
+For each cleaved peptide (aligned or unaligned), we get its log2 fold change relative to control for subsequent analysis (Appendix S4, S6B).
+
+```{r write-sig-peptide-profiles}
+get_peptide_profile <- function(res, condition_name, peptide_list, text) {
+  df <- as.data.frame(res)
+  df$peptide_original <- rownames(df)
+  df <- df[!is.na(df$log2FoldChange), ]
+  df$condition   <- condition_name
+  df$fold_change <- df$log2FoldChange 
+  df$pep_clean <- gsub("-", "", df$peptide_original)
+  peptide_list_clean <- gsub("-", "", peptide_list)
+  keep <- df$pep_clean %in% peptide_list_clean
+  df$peptide <- peptide_list[ match(df$pep_clean, peptide_list_clean) ]
+
+  #screens for match
+  # if peptide list has -, remove (not necessarily, but when finding match)
+  df <- df[keep, ]
+  out <- df[, c("peptide", "log2FoldChange"), drop = FALSE]
+      write.table(out, file = paste0("peptide_profile_", condition_name, text, ".txt"), sep = "\t", quote = FALSE, row.names = FALSE )
+  return(out)
+}
+
+for(i in 1:length(proteases)){
+  res_prot <- results(dds_protease, contrast=c("condition",proteases[i],"FLAG"), alpha=pvalthreshold,pAdjustMethod = "bonf")
+    profile <- get_peptide_profile(res_prot, proteases[i], peptideList_relaxed[[proteases[i]]], "_relaxed_unaligned")
+  profile <- get_peptide_profile(res_prot, proteases[i], alignedpeptideList_relaxed[[proteases[i]]], "_relaxed_aligned")
+}
+
+```
+
+Then, we plot the distribution of log-2-fold changes for the peptide profiles (Appendix S4):
+
+```{r plot-peptide-enrichment-dists}
+read_peptide_profile <- function(file) {
+  if (!file.exists(file)) return(NULL)
+  df <- read.table(file, header = TRUE, sep = "\t", stringsAsFactors = FALSE, check.names = FALSE)
+  return(setNames(df$log2FoldChange, df$peptide))
+}
+
+all_rows <- lapply(seq_along(combined), function(j) {
+
+  profiles <- list(
+    "DESeq2"            = read_peptide_profile(paste0("peptide_profile_", combined[j], ".txt")),
+    "Aligned relaxed"   = read_peptide_profile(paste0("peptide_profile_", combined[j], "_relaxed_aligned.txt")),
+    "Unaligned relaxed" = read_peptide_profile(paste0("peptide_profile_", combined[j], "_relaxed_unaligned.txt"))
+  )
+
+  profiles <- lapply(profiles, function(x) {
+    if (!is.data.frame(x)) data.frame(log2FoldChange = x) else x
+  })
+
+  row_plots <- lapply(names(profiles), function(nm) {
+    df <- profiles[[nm]]
+
+    ggplot(df, aes(x = log2FoldChange)) +
+      geom_density(fill = "grey80", alpha = 0.6) +
+      geom_vline(xintercept = 0, linetype = "dashed") +
+      ggtitle(paste0(nm, "\n(n=", nrow(df), ")")) +
+      theme_bw(base_size = 9) +
+      theme(
+        plot.title = element_text(size = 9),
+        axis.title.y = element_blank()
+      )
+  })
+
+  row_panel <- wrap_plots(row_plots, nrow = 1)
+
+  wrap_plots(
+    ggplot() +
+      annotate("text", x = 0, y = 0, label = combined[j],
+               angle = 90, size = 2, fontface = "bold") +
+      theme_void(),
+    row_panel,
+    widths = c(0.05, 0.95)
+  )
+})
+
+final_plot <- wrap_plots(all_rows, ncol = 1)
+final_plot
+
+```
+
+# PWM validation and substrate scoring
+
+Known MEROPS cleavage sites are mapped onto AlphaFold models and scored with the phage-derived PWMs / peptide profiles. Structural features are computed at each candidate P1 (and flanking) position.
+
+### PDB Downloading
+
+We first download PDB protein structure files from AlphaFold2/EBI for reviewed human UniProt entries. This step is long-running and is left as `eval = FALSE` by default.
+
+```{r download-alphafold-pdbs, eval=FALSE}
+uniprot_tbl <- read.table("uniprotkb_taxonomy_id_9606_AND_reviewed_2024_05_31.tsv", sep = "\t", header = TRUE)
+ensembl <- useMart("ensembl", dataset="hsapiens_gene_ensembl")
+uniprot_ids <- uniprot_tbl$Entry
+get_alphafold_pdb <- function(uniprot_id) {
+  attributes <- c("hgnc_symbol")
+  protein_info <- getBM(attributes = attributes, filters = "uniprot_gn_id", values = uniprot_id, mart = ensembl)
+  if(nrow(protein_info) == 0){
+    cat("No entry found for UniProt ID:", uniprot_id, "\n")
+    return(NULL)
+  }
+  protein_name <- protein_info$hgnc_symbol[1]
+  
+  # This is an example URL pattern; real pattern may differ
+  alphafold_url_pattern <- "https://alphafold.ebi.ac.uk/files/AF-%s-F1-model_v1.pdb"
+  
+  pdb_url <- sprintf(alphafold_url_pattern, uniprot_id)
+  pdb_filename <- paste0(protein_name, "_", uniprot_id, ".pdb")
+  tryCatch({
+    download.file(pdb_url, destfile = paste0("PDBs/",pdb_filename), method = "auto")
+    cat("Downloaded PDB file for protein", protein_name, "with UniProt ID", uniprot_id, "to", pdb_filename, "\n")
+    return(protein_name)
+  }, error=function(e) {
+    cat("Error downloading PDB file for UniProt ID:", uniprot_id, "error:", e$message, "\n")
+  })
+}
+
+for (uniprot_id in uniprot_ids) {
+  protein_name <- get_alphafold_pdb(uniprot_id)
+}
+
+```
+
+We then setup the PDB directories, and define helper functions to read PWM and peptide profile files. We created a function to transform the peptide profile from 5-mers to 4-mers for more flexibility in matching if necessary (rather than requiring an exact full 5-mer match). An additional helper function finds the signal peptide position for each protein from UniProt.
+
+```{r pdb-and-profile-helpers}
+pwm_dir      <- "PWM"
+peptide_dir  <- "."
+cutscore_dir <- "cut_scores"
+pdb_directory <- "F:/Enoch/PDBs"
+pdb_files <- list.files(path = pdb_directory, pattern = "\\.pdb$", full.names = TRUE)
+pdb_file_names <- basename(pdb_files)
+pdb_data_frame <- data.frame(full_name = pdb_file_names) %>%
+  separate(full_name, into = c("protein_name", "uniprot_id"), sep = "_", remove = FALSE) %>%
+  mutate(uniprot_id = gsub("\\.pdb$", "", uniprot_id)) %>%
+  dplyr::select(protein_name, uniprot_id)
+
+head(print(pdb_data_frame))
+
+get_signal_peptide_position <- function(uniprot_id) {
+  url <- paste0("https://rest.uniprot.org/uniprotkb/", uniprot_id, ".json")
+  response <- httr::GET(url)
+  if (response$status_code != 200) {
+    warning("Failed to retrieve UniProt JSON for: ", uniprot_id)
+    return(NULL)
+  }
+  #j <- httr::content(response, as = "parsed")
+  j <- httr::content(response, as = "parsed", type = "application/json")
+  feats <- j$features
+  if (is.null(feats)) return(NULL)
+  sig <- feats[sapply(feats, function(x) x$type == "Signal")]
+  if (length(sig) == 0) return(NULL)
+  begin <- sig[[1]]$location$start$value
+  end   <- sig[[1]]$location$end$value
+  return(list(begin = begin, end = end))
+}
+
+read_pwm_file <- function(file) {
+  if (!file.exists(file)) return(NULL)
+  m <- as.matrix(read.table(file, header = TRUE, check.names = FALSE))
+  rownames(m) <- as.character(1:nrow(m))
+  m <- t(m)
+  print(m)
+}
+
+
+
+make_pep_vec_shifted <- function(pep_vec) {
+  expand_peptide <- function(pep) {
+    aa <- strsplit(pep, "")[[1]]
+    variants <- c(pep)   # include original
+    for (i in seq_along(aa)) {
+      if (aa[i] != "-") {
+        tmp <- aa
+        tmp[i] <- "-"
+        variants <- c(variants, paste0(tmp, collapse = ""))
+      }
+    }
+    unique(variants)
+  }
+  expanded_names <- unlist(lapply(names(pep_vec), expand_peptide))
+  expanded_values <- unlist(lapply(seq_along(pep_vec), function(i) {
+    rep(pep_vec[i], length(expand_peptide(names(pep_vec)[i])))
+  }))
+
+  names(expanded_values) <- expanded_names
+  return(expanded_values)
+}
+```
+
+### Identification of known substrate cleavage sites
+
+We searched the MEROPS database for known cleavage sites of cathepsin G and elastase, and matched substrates to those within the UniProt database. The cleavage site was mapped onto each substrate within the UniProt / AlphaFold sequence (Appendix S1).
+
+| Protease | Substrates | Cut sites | Physiological / non-physiological |
+|----------|------------|-----------|-----------------------------------|
+| cathepsin G | 164 | 265 | 47 / 217 |
+| elastase | 188 | 347 | 125 / 219 |
+| Total (union) | 270 | 581 | — |
+
+Mapped motifs are written to `<protease>_merops_mapped.csv` (`eval = FALSE` if already generated).
+
+```{r map-merops-cleavage-sites, eval=FALSE}
+merops_files <- c("cathepsin G_merops.csv", "elastase_merops.csv")
+merops_list <- lapply(merops_files, read.csv, stringsAsFactors = FALSE)
+names(merops_list) <- c("catG", "elastase")
+
+catG_uniprot     <- read.csv("cathepsin G_merops.csv", stringsAsFactors = FALSE)$Uniprot
+elastase_uniprot <- read.csv("elastase_merops.csv", stringsAsFactors = FALSE)$Uniprot
+uniprot_lists <- list(catG = catG_uniprot, elastase = elastase_uniprot)
+all_uniprot <- unique(c(catG_uniprot, elastase_uniprot))
+pdb_subset <- pdb_data_frame[pdb_data_frame$uniprot_id %in% all_uniprot, ]
+
+
+pdb_dir <- "F:/Enoch/PDBs/"
+pdb_files <- list.files(pdb_dir, full.names = TRUE)
+pdb_lookup <- setNames(pdb_files, basename(pdb_files))
+
+find_motif <- function(seq, motif) {
+  L <- nchar(seq)
+  M <- nchar(motif)
+  if (M == 0 || L < M) return(NA)
+  aa_motif <- strsplit(motif, "")[[1]]
+  for (i in 1:(L - M + 1)) {
+    seg <- substr(seq, i, i + M - 1)
+    aa_seg <- strsplit(seg, "")[[1]]
+    match_ok <- all(aa_motif == "-" | aa_motif == aa_seg)
+    if (match_ok) return(i)   # return first match
+  }
+  return(NA)
+}
+
+aa1 <- c(Ala="A", Arg="R", Asn="N", Asp="D", Cys="C", Gln="Q", Glu="E", Gly="G",His="H", Ile="I", Leu="L", Lys="K",Met="M", Phe="F", Pro="P", Ser="S",Thr="T", Trp="W", Tyr="Y", Val="V", "-"="-")
+
+for (i in seq_along(proteases)) {
+  protease_df <- read.csv(paste0(combined[i], "_merops.csv"), stringsAsFactors = FALSE)
+  protease_df <- protease_df[, c("Substrate", "Uniprot", "Residue.range", "Cleavage.Site","Cleavage.type", "Evidence", "P4","P3","P2","P1","P1.","P2.","P3.","P4.","Reference")]
+protease_df$motif_8mer <- apply(protease_df, 1, function(x) {
+  paste0(x["P4"], x["P3"], x["P2"], x["P1"],x["P1."], x["P2."], x["P3."], x["P4."])})
+  output_file <- paste0(combined[i], "_merops_mapped.csv")
+  header <- c("substrate","uniprot","protein","pdb_file","residue_range","cleavage_site","cleavage_type","evidence","motif_8mer","motif_start","P1_position","P1prime","reference")
+  header_df <- as.data.frame(t(header), stringsAsFactors = FALSE)
+  write.table(header_df, file = output_file, sep = ",", quote = TRUE, row.names = FALSE, col.names = TRUE )
+  protease_df$motif_8mer <- apply(protease_df, 1, function(x) { paste0( aa1[x["P4"]], aa1[x["P3"]], aa1[x["P2"]], aa1[x["P1"]], aa1[x["P1."]], aa1[x["P2."]], aa1[x["P3."]], aa1[x["P4."]] ) })
+  for (i in 1:nrow(protease_df)) {
+    uniprot <- protease_df$Uniprot[i]
+    substrate_name <- protease_df$Substrate[i]
+    motif <- protease_df$motif_8mer[i]
+    protein_name <- pdb_data_frame$protein_name[pdb_data_frame$uniprot_id == uniprot]
+    if (length(protein_name) == 0) {
+        cat("No PDB for", uniprot, "\n")
+        next
+    }
+    filename <- paste0(protein_name, "_", uniprot, ".pdb")
+    if (!filename %in% names(pdb_lookup)) {
+        cat("Missing PDB:", filename, "\n")
+        next
+    }
+    pdb_path <- pdb_lookup[[filename]]
+    pdb <- read.pdb(pdb_path)
+    aa.seq <- paste0(pdbseq(pdb), collapse = "")
+    pos_start <- find_motif(aa.seq, motif)
+    P1  <- if (!is.na(pos_start)) pos_start + 3 else NA
+    P1p <- if (!is.na(pos_start)) pos_start + 4 else NA
+
+    out <- data.frame(
+        substrate      = substrate_name,
+        uniprot        = uniprot,
+        protein        = protein_name,
+        pdb_file       = filename,
+        residue_range  = protease_df$Residue.range[i],
+        cleavage_site  = protease_df$Cleavage.Site[i],
+        cleavage_type  = protease_df$Cleavage.type[i],
+        evidence       = protease_df$Evidence[i],
+        motif_8mer     = motif,
+        motif_start    = pos_start,
+        P1_position    = P1,
+        P1prime        = P1p,
+        reference      = protease_df$Reference[i],
+        stringsAsFactors = FALSE
+    )
+    write.table( out, file = output_file, sep = ",", quote = TRUE, row.names = FALSE, col.names = FALSE, append = TRUE )
+    cat("Mapped:", substrate_name, "→", filename, "\n")
+    }
+}
+
+```
+
+Build the MEROPS-substrate PDB subset (also needed when the mapping chunk above is skipped):
+
+```{r build-pdb-subset}
+catG_uniprot     <- read.csv("cathepsin G_merops.csv", stringsAsFactors = FALSE)$Uniprot
+elastase_uniprot <- read.csv("elastase_merops.csv", stringsAsFactors = FALSE)$Uniprot
+all_uniprot <- unique(c(catG_uniprot, elastase_uniprot))
+pdb_subset <- pdb_data_frame[pdb_data_frame$uniprot_id %in% all_uniprot, , drop = FALSE]
+message(sprintf("pdb_subset: %d proteins with PDBs among %d MEROPS UniProt IDs",
+                nrow(pdb_subset), length(all_uniprot)))
+```
+
+Sequence logos of MEROPS cleavage motifs for all mapped substrates and the physiological subset (Appendix S2):
+
+```{r plot-merops-substrate-seqlogos}
+motif_list <- list()
+n_list <- c()
+motif_list_p <- list()
+n_list_p <- c()
+
+
+for (i in seq_along(proteases)) {
+  df_merops <- read.csv( paste0(combined[i], "_merops_mapped.csv"), stringsAsFactors = FALSE, skip = 1 ) %>%   transmute(uniprot, substrate, pos = P1_position, cleavage_type = cleavage_type, is_merops = TRUE) 
+  df_merops <- df_merops %>% group_by(uniprot, pos) %>% summarise(substrate     = dplyr::first(substrate),cleavage_type = paste(sort(unique(cleavage_type)), collapse = "/"), is_merops = TRUE,.groups = "drop")
+  df <- df_merops
+  df <- read.csv(paste0(combined[i], "_merops_mapped.csv"), stringsAsFactors = FALSE, skip = 1)
+  df2 <- df[df$cleavage_type == "P", ]
+  motifs <- toupper(df$motif_8mer[str_length(df$motif_8mer) == 8])
+  motif_list[[combined[i]]] <- motifs
+  n_list[combined[i]] <- length(motifs)
+  motifs_p <- toupper(df2$motif_8mer[str_length(df2$motif_8mer) == 8])
+  motif_list_p[[combined[i]]] <- motifs_p
+  n_list_p[combined[i]] <- length(motifs_p)
+}
+
+names(motif_list) <- paste0(names(motif_list), " (n=", lengths(motif_list), ")")
+save_fig(
+  ggseqlogo(motif_list, method = "bits") + scale_x_continuous(
+    breaks = 1:8,
+    labels = c("P4", "P3", "P2", "P1", "P1′", "P2′", "P3′", "P4′")
+  ),
+  "merops_motifs_bits", width = 10, height = 4
+)
+save_fig(
+  ggseqlogo(motif_list, method = "prob") + scale_x_continuous(
+    breaks = 1:8,
+    labels = c("P4", "P3", "P2", "P1", "P1′", "P2′", "P3′", "P4′")
+  ),
+  "merops_motifs_prob", width = 10, height = 4
+)
+
+names(motif_list_p) <- paste0(names(motif_list_p), " (n=", lengths(motif_list_p), ")")
+save_fig(
+  ggseqlogo(motif_list_p, method = "bits") + scale_x_continuous(
+    breaks = 1:8,
+    labels = c("P4", "P3", "P2", "P1", "P1′", "P2′", "P3′", "P4′")
+  ),
+  "merops_motifs_filtered_bits", width = 10, height = 4
+)
+save_fig(
+  ggseqlogo(motif_list_p, method = "prob") + scale_x_continuous(
+    breaks = 1:8,
+    labels = c("P4", "P3", "P2", "P1", "P1′", "P2′", "P3′", "P4′")
+  ),
+  "merops_motifs_filtered_prob", width = 10, height = 4
+) 
+
+```
+
+### PWM and peptide scoring
+
+For the mature protein sequence (after signal peptide), we scored each potential cleavage site using a sliding window approach to calculate a PWM match for that site, as a sum of the probability at each position. This uses 5-mers (an average of all possible 5-mers that include the cleavage site, max 4) or 9-mers (the extent of the match using the cleavage site as P1). If weighted, the PWM's contribution to the score at each position diminishes incrementally by 10% per shift away from P1.
+
+For peptide profiles, each cleavage site was scored by the log2 fold change. For 5-mers, the score represented the sum of log2 fold-changes of all possible 5-mers that include the cleavage site. For 9-mers, the score represented a log2 fold-change with a 9-mer match for the site (Appendix S6).
+
+```{r define-site-scoring-functions, eval=FALSE}
+score_pwm_at_position <- function(seq, pwm, b, weighting = FALSE) {
+  L <- nchar(seq)
+  k <- ncol(pwm)
+  if (k == 5) {
+    scores <- c()
+    starts <- (b - 3):b
+    for (s in starts) {
+      if (s >= 1 && (s + 4) <= L) {
+        mer <- substr(seq, s, s + 4)
+        aa <- strsplit(mer, "")[[1]]
+        if (all(aa %in% rownames(pwm))) {
+          scores <- c(scores, sum(pwm[cbind(aa, 1:5)]))
+          #print(cat(sum(pwm[cbind(aa, 1:5)]), aa))
+        }
+      }
+    }
+    if (length(scores) == 0) return(NA_real_)
+    return(mean(scores))
+  }
+  
+  if (k == 9) {
+    full_left  <- b - 4 
+    full_right <- b + 4 
+    start_use <- max(1, full_left) 
+    end_use   <- min(L, full_right) 
+    mer <- substr(seq, start_use, end_use)
+    aa  <- strsplit(mer, "")[[1]]
+    #print(aa)
+    
+    left_missing <- max(0, 1 - full_left)
+    score <- 0
+    for (i in seq_along(aa)) {
+      pwm_col <- max(1, 6-b) + i - 1
+      if (pwm_col >= 1 && pwm_col <= 9) {
+        aa_res <- aa[i]
+        if (aa_res %in% rownames(pwm)) {
+          score = score + pwm[aa_res, pwm_col]
+          
+          if (weighting){
+            pwm_weight <- function(col) {
+             dist <- abs(col - 5)
+             weight <- 1 - 0.1 * dist   # drop 10% per step away
+              return(max(weight, 0))      # avoid negatives
+             }
+            score = score * pwm_weight(pwm_col)
+          }
+        }
+      }
+    }
+    #print(score)
+    return(score)
+  }
+  return(NA_real_)
+}
+
+score_peptide_at_position <- function(seq, pep_vec, b, parts = FALSE, pep_vec_flexible = NA) {
+  L <- nchar(seq)
+  k <- nchar(names(pep_vec)[1])
+  match_peptide_wildcard <- function(mer, pep) {
+      aa_mer <- strsplit(mer, "")[[1]]
+      aa_pep <- strsplit(pep, "")[[1]]
+      N <- min(length(aa_mer), length(aa_pep))
+      all(aa_pep[1:N] == "-" | aa_pep[1:N] == aa_mer[1:N])
+    }
+  if (k == 5) {
+    scores <- c()
+    starts <- (b - 3):b  # windows that influence cut b
+    for (s in starts) {
+      if (s >= 1 && (s + 4) <= L) {
+        mer <- substr(seq, s, s + 4)
+        if (mer %in% names(pep_vec)) {
+          scores <- c(scores, pep_vec[[mer]])
+          #print(cat(pep_vec[[mer]], mer))
+          next
+        }
+          if (parts){
+          for (pep in names(pep_vec_flexible)) {
+            if (match_peptide_wildcard(mer, pep)){
+              scores <- c(scores, pep_vec_flexible[[pep]])
+              break
+            }  
+          }
+        }
+      }
+    }
+    if (length(scores) == 0) {return(NA_real_)}
+    return(mean(scores))
+  }
+
+  if (k == 9) {
+    full_left  <- b - 4
+    full_right <- b + 4
+    start_use <- max(1, full_left)
+    end_use   <- min(L, full_right)
+    mer <- substr(seq, start_use, end_use)
+
+    N   <- nchar(mer)
+    best_score <- NA_real_
+    if (nchar(mer) == 9) {
+      for (pep in names(pep_vec)) {
+        if (match_peptide_wildcard(mer, pep)) {
+          best_score <- pep_vec[[pep]]
+          return(best_score)
+          break
+        }
+      }
+      if (parts){
+        for (pep in names(pep_vec_flexible)) {
+          if (match_peptide_wildcard(mer, pep)) {
+            best_score <- pep_vec_flexible[[pep]]
+            return(best_score)
+            break
+          }
+        }
+      }
+    }
+  }
+  return(NA_real_)
+
+}
+```
+
+We run these functions per condition per protein, for each of the described methods. While 18,617 proteins were available, due to computational limitations and as a pilot, only proteins documented to be cleaved by either cathepsin G or elastase were tested. 
+
+
+Score all candidate sites on MEROPS-mapped substrates (long-running; eval = FALSE after CSVs exist):
+
+```{r score-all-cut-sites, eval = FALSE}
+for(j in 1:length(combined)){
+  id = combined[j]
+  pwm_deseq2 <- read_pwm_file(paste0(combined[j], '_deseq2_pwm.txt'))
+  profile_deseq2 <- read_peptide_profile(paste0('peptide_profile_',combined[j], '.txt'))
+  profile_deseq2_flexible = make_pep_vec_shifted(profile_deseq2)
+  mode = 'relaxed_'
+  pwm_aligned_relaxed <- read_pwm_file( paste0(combined[j], "_", mode, "aligned_pwm.txt") ) 
+  pwm_unaligned_relaxed <- read_pwm_file( paste0(combined[j], "_", mode, "pwm.txt"))
+  profile_aligned_relaxed <- read_peptide_profile( paste0("peptide_profile_", combined[j], "_", mode, "aligned.txt") ) 
+  profile_unaligned_relaxed <- read_peptide_profile(paste0("peptide_profile_", combined[j], "_", mode, "unaligned.txt")) 
+    
+  profile_aligned_flexible_relaxed  <- make_pep_vec_shifted(profile_aligned_relaxed)  
+  profile_unaligned_flexible_relaxed <- make_pep_vec_shifted(profile_unaligned_relaxed)
+
+
+  for(i in 1:length(pdb_subset$protein_name)){
+    protein_name <- pdb_subset[i,1]
+    uniprot_id <- pdb_subset[i,2]
+    pdb_dir <- "F:/Enoch/PDBs/"
+    filename <- paste0(protein_name, "_", uniprot_id, ".pdb")
+    pdb_path <- file.path(pdb_dir, filename)
+    pdb <- read.pdb(pdb_path)
+    aa.seq  <- paste(pdbseq(pdb), collapse="")
+    signal_peptide_position <- get_signal_peptide_position(uniprot_id)
+    
+    if (!is.null(signal_peptide_position)) {
+    cat("Signal Peptide Position for", uniprot_id, ": Start -", signal_peptide_position$begin, "End -", signal_peptide_position$end, "\n")
+    } else {
+    cat("No signal peptide information found for", uniprot_id, "\n")
+    }
+    if (!is.null(signal_peptide_position)) {
+      if(is.na(signal_peptide_position$end)){
+        mature_protein_sequence <- aa.seq
+        } else {
+        mature_protein_sequence <- substring(aa.seq, signal_peptide_position$end + 1)}
+      } else {
+        mature_protein_sequence <- aa.seq
+      }
+    seq <- mature_protein_sequence
+    L <- nchar(mature_protein_sequence)
+    out <- data.frame()
+    for (b in 1:(L-1)) {
+      print(b)
+      row <- list(
+        protein = protein_name,
+        uniprot = uniprot_id,
+        pos     = b,
+        pwm_deseq2  = score_pwm_at_position(seq, pwm_deseq2, b),
+        pwm_relaxed_unaligned = score_pwm_at_position(seq, pwm_unaligned_relaxed, b),
+        pwm_relaxed_aligned   = score_pwm_at_position(seq, pwm_aligned_relaxed, b),
+        pwm_relaxed_aligned_weighted  = score_pwm_at_position(seq, pwm_aligned_relaxed, b, weighting = TRUE),
+        
+        pep_deseq2           = score_peptide_at_position(seq, profile_deseq2, b),
+        pep_relaxed_unaligned   = score_peptide_at_position(seq, profile_unaligned_relaxed, b),
+        pep_relaxed_aligned = score_peptide_at_position(seq, profile_aligned_relaxed, b)
+   )
+      out <- rbind(out, row)
+    }
+    dir.create(id, showWarnings = FALSE)
+    write.table(
+      out,
+      file = paste0(id, "/", id, "_", protein_name, "_", uniprot_id, ".csv"),
+      sep = ",",
+      quote = FALSE,
+      row.names = FALSE
+    )
+  }
+}
+```
+
+
+We first merged the data from all proteins and shifted for the correct position (includes signal peptide). We then normalized cut scores per score type, per protein, using Z-scores or 0-1 min-max.
+
+Merge per-protein score CSVs into <protease>_all_cut_scores.csv (positions adjusted for signal peptides), then write within-substrate z-score and 0-1 normalized tables:
+
+```{r merge-and-normalize-cut-scores, eval=FALSE, warning = FALSE}
+for (i in seq_along(combined)) {
+  dir_in  <- paste0("F:/Alphafold Phage Project/", combined[i])
+  files <- list.files(dir_in, pattern = "\\.csv$", full.names = TRUE)
+  files <- files[!grepl("all_cut_scores", files)]
+  merged <- do.call(rbind, lapply(files, function(f) {
+    df <- read.csv(f, stringsAsFactors = FALSE)
+    uniprot_id <- unique(df$uniprot)
+    if (length(uniprot_id) != 1) {
+      stop(paste("Multiple UniProt IDs in file:", f))
+    }
+    sp <- get_signal_peptide_position(uniprot_id)
+    sp_end <- 0
+    if (!is.null(sp) && !is.na(sp$end)) {
+      sp_end <- sp$end
+    }
+    df$pos <- df$pos + sp_end
+    df
+  }))
+  
+  write.csv(
+    merged,
+    file = paste0(dir_in, "/", combined[i], "_all_cut_scores.csv"),
+    row.names = FALSE
+  )
+}
+
+for (i in seq_along(combined)) {
+  dir_in <- paste0("F:/Alphafold Phage Project/", combined[i])
+  df <- read.csv(
+    paste0(dir_in, "/", combined[i], "_all_cut_scores.csv"),
+    stringsAsFactors = FALSE
+  )
+  df$.row_id <- seq_len(nrow(df))
+  score_cols <- names(df)[grepl("^(pwm_|pep_)", names(df))]
+  df_z <- df %>%
+  group_by(uniprot) %>%
+  mutate(
+    across(
+      all_of(score_cols),
+      ~ {
+        mu <- mean(.x, na.rm = TRUE)
+        sdv <- sd(.x, na.rm = TRUE)
+        if (is.na(sdv) || sdv == 0) NA_real_
+        else (.x - mu) / sdv
+      }
+    )
+  ) %>%
+  ungroup() %>%
+  arrange(.row_id)
+
+  write.csv(
+    df_z,
+    paste0(dir_in, "/", combined[i], "_all_cut_scores_z.csv"),
+    row.names = FALSE
+  )
+  df_mm <- df %>%
+  group_by(uniprot) %>%
+  mutate(
+    across(
+      all_of(score_cols),
+      ~ {
+        r <- range(.x, na.rm = TRUE)
+        if (diff(r) == 0) NA_real_
+        else (.x - r[1]) / diff(r)
+      }
+    )
+  ) %>%
+  ungroup() %>%
+  arrange(.row_id)
+    
+  write.csv(
+    df_mm,
+    paste0(dir_in, "/", combined[i], "_all_cut_scores_01.csv"),
+    row.names = FALSE
+  )
+}
+```
+
+We visualized the cut score distribution across conditions.
+
+Distributions of PWM-based and peptide-match cut scores (raw, z-score, and 0–1) across all possible sites (Appendix S6):
+
+```{r plot-cutscore-distributions, eval=FALSE}
+score_cols <- c( "pwm_deseq2", "pwm_relaxed_unaligned", "pwm_relaxed_aligned")
+score_cols_name <- c( "DESeq2 (PWM)", "Sig peptides (PWM; relaxed unaligned)", "Sig peptides (PWM; relaxed aligned)" )
+names(score_cols_name) <- score_cols
+
+suffixes = c("", "_z", "_01")
+combined2 <- proteases 
+for (j in 1:3){
+  all_rows <- lapply(seq_along(combined2), function(i) {
+  dir_in <- paste0("F:/Alphafold Phage Project/", combined2[i])
+  df_all <- read.csv(paste0(dir_in, "/", combined2[i], "_all_cut_scores", suffixes[j], ".csv"),stringsAsFactors = FALSE)
+  score_cols <- paste0(score_cols)
+  names(score_cols_name) <- score_cols
+
+  row_plots <- lapply(score_cols, function(sc) {
+    df <- df_all[!is.na(df_all[[sc]]), , drop = FALSE]
+    ggplot(df, aes(x = .data[[sc]])) +
+  geom_density(fill = "grey80", alpha = 0.6) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(x = "Cut score") +
+  ggtitle(paste0(score_cols_name[sc], "\n(n=", nrow(df), ")"))+
+  theme_bw(base_size = 9) +
+  theme(
+    plot.title = element_text(size = 9),
+    axis.title.y = element_blank()
+  )
+  })
+  row_panel <- wrap_plots(row_plots, nrow = 1)
+  wrap_plots(
+    ggplot() +
+      annotate("text", x = 0, y = 0, label = combined2[i],
+               angle = 90, size = 2, fontface = "bold") +
+      theme_void(),
+    row_panel,
+    widths = c(0.05, 0.95)
+  )
+})
+
+final_plot <- wrap_plots(all_rows, ncol = 1)
+print(final_plot)
+
+score_cols <- c("pep_deseq2", "pep_relaxed_unaligned", "pep_relaxed_aligned")
+score_cols_name <- c("DESeq2 (peptides)", "Sig peptides (peptides; relaxed unaligned)", "Sig peptides (peptides; relaxed aligned)")
+
+names(score_cols_name) <- score_cols
+all_rows <- lapply(seq_along(combined2), function(i) {
+  dir_in <- paste0("F:/Alphafold Phage Project/", combined2[i])
+  df_all <- read.csv(paste0(dir_in, "/", combined2[i], "_all_cut_scores", suffixes[j], ".csv"),stringsAsFactors = FALSE)
+  names(score_cols_name) <- score_cols
+
+  row_plots <- lapply(score_cols, function(sc) {
+    df <- df_all[!is.na(df_all[[sc]]), , drop = FALSE]
+    ggplot(df, aes(x = .data[[sc]])) +
+  geom_density(fill = "grey80", alpha = 0.6) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(x = "Cut score") +
+  ggtitle(paste0(score_cols_name[sc], "\n(n=", nrow(df), ")"))+
+  theme_bw(base_size = 9) +
+  theme(
+    plot.title = element_text(size = 9),
+    axis.title.y = element_blank()
+  )
+  })
+  row_panel <- wrap_plots(row_plots, nrow = 1)
+  wrap_plots(
+    ggplot() +
+      annotate("text", x = 0, y = 0, label = combined2[i],
+               angle = 90, size = 2, fontface = "bold") +
+      theme_void(),
+    row_panel,
+    widths = c(0.05, 0.95)
+  )
+})
+final_plot <- wrap_plots(all_rows, ncol = 1)
+print(final_plot)
+}
+```
+
+#### Protein structure accessibility scoring
+
+Using the DSSP package, for each potential cut site and its window of 4 amino acids before and after, we scored the relative solvent accessible area, secondary structure, closest distance to the surface, number of neighbors (crowding), and level of flexibility or disorder (pLDDT). Results are written to ALL_PROTEINS_structural_cutsite_features.csv.
+
+```{r compute-structural-features, eval = FALSE}
+all_results <- list() 
+row_id <- 1
+for (p in seq_len(nrow(pdb_subset))) {
+  protein_name <- pdb_subset[p, 1]
+  uniprot_id   <- pdb_subset[p, 2]
+  pdb_path <- paste0("F:/Enoch/PDBs/", protein_name, "_", uniprot_id, ".pdb")
+  pdb <- read.pdb(pdb_path)
+  aa.seq <- paste(pdbseq(pdb), collapse = "")
+  L <- nchar(aa.seq)
+  dssp <- dssp(pdb, exefile = "C:/Users/enoch/Downloads/dssp-2.2.1-win64.exe", resno=T, full=FALSE, verbose=FALSE) %>% suppressWarnings()## using dssp, note, DSSP show every AA 
+
+  acc <- dssp$acc
+  ss  <- dssp$ss
+
+  # CA atoms
+  ca_inds <- atom.select(pdb, elety = "CA", protein = TRUE)
+  ca_xyz  <- pdb$xyz[ca_inds$xyz]
+  bfac    <- pdb$atom$b[ca_inds$atom]
+
+  # Distance matrix (once per protein)
+  dmat <- dist.xyz(ca_xyz)
+
+  surf_res <- which(acc > 30)
+
+  map_ss <- function(x) {
+    if (x %in% c("H","G","I")) return("helix")
+    if (x %in% c("E","B"))     return("sheet")
+    return("loop")
+  }
+  
+  for (i in 1:(L - 4)) {
+    P1  <- i
+    P1p <- i + 1
+    window <- (i - 4):(i + 4)
+    window <- window[window >= 1 & window <= L]
+
+    rSASA_P1     <- acc[P1] #relative solvent accessible area
+    rSASA_P1p    <- acc[P1p]
+    mean_rSASA_w <- mean(acc[window], na.rm = TRUE) #relative solvent accesible area in 9-mer window
+    max_rSASA_w  <- max(acc[window], na.rm = TRUE) #mas RASA in 9-mer window
+    pct_exposed_w <- mean(acc[window] > 25, na.rm = TRUE) #fraction of residues above 25, 1 = exposed, 0 = buried
+
+    SS_P1  <- map_ss(ss[P1]) #secondary structure (proteases prefer loops > sheets > helices)
+    SS_P1p <- map_ss(ss[P1p]) 
+
+    res_depth_P1 <- min(dmat[P1, surf_res], na.rm = TRUE) #distance from P1 to nearest surface-exposed residue, near surface or not 
+    neighbors_6A <- sum(dmat[P1, ] <= 6, na.rm = TRUE) - 1 #spatial crowding, within 6A of P1
+    neighbors_8A <- sum(dmat[P1, ] <= 8, na.rm = TRUE) - 1 #spatial crowding, within 8A of P1
+    pLDDT_P1     <- bfac[P1] #low = flexibility/disorder, disordered, easier to cleave
+    mean_pLDDT_w <- mean(bfac[window], na.rm = TRUE) #mean PLDDT across P4-P41'
+    
+    all_results[[row_id]] <- data.frame( protein_name = protein_name, uniprot_id   = uniprot_id, P1_position  = P1, rSASA_P1     = rSASA_P1, rSASA_P1p    = rSASA_P1p, mean_rSASA_w = mean_rSASA_w, max_rSASA_w  = max_rSASA_w, pct_exposed_w = pct_exposed_w, SS_P1        = SS_P1, SS_P1p       = SS_P1p, residue_depth_P1 = res_depth_P1, neighbors_6A     = neighbors_6A, neighbors_8A     = neighbors_8A, pLDDT_P1     = pLDDT_P1, mean_pLDDT_w = mean_pLDDT_w )
+    row_id <- row_id + 1
+  }
+}
+
+df_all <- bind_rows(all_results)
+write.csv(df_all,file = "ALL_PROTEINS_structural_cutsite_features.csv",row.names = FALSE)
+```
+
+Load the structural feature table and shift positions by UniProt signal-peptide ends so they align with scored cut sites:
+
+```{r load-cutsite-features}
+df_cutsite <- read.csv( file = paste0("ALL_PROTEINS_structural_cutsite_features.csv"))
+df_cutsite <- df_cutsite %>% dplyr::rename( protein = protein_name, uniprot = uniprot_id, pos = P1_position )  
+set.seed(123)
+# Prefer MEROPS PDB subset when available; otherwise use UniProt IDs already in the structural table
+uniprot_for_sp <- if (exists("pdb_subset") && nrow(pdb_subset) > 0) {
+  pdb_subset %>% dplyr::distinct(uniprot_id)
+} else {
+  df_cutsite %>% dplyr::distinct(uniprot) %>% dplyr::rename(uniprot_id = uniprot)
+}
+sp_table <- uniprot_for_sp %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(sp_end = {
+    sp <- get_signal_peptide_position(uniprot_id)
+    if (is.null(sp) || is.na(sp$end)) 0 else sp$end
+  }) %>%
+  dplyr::ungroup() %>%
+  dplyr::rename(uniprot = uniprot_id)
+df_cutsite <- df_cutsite %>%
+  dplyr::left_join(sp_table, by = "uniprot") %>%
+  dplyr::mutate(pos = pos + dplyr::coalesce(sp_end, 0)) %>%
+  dplyr::filter(pos >= 1) %>%
+  dplyr::select(-sp_end)
+```
+
+
+#### PWM Validation
+
+After characterizing the distribution of cut scores and normalizing them, we sought to validate their performance on identifying known substrates of cathepsin G and elastase. To do this, we labeled the PWM or peptide match scores of known cleavage sites, relative to the distribution of other cut scores for that protein. We also evaluated the cut scores across all cleaved sites, with the expectation of it trending to 1.00.
+
+We first define helper functions and select 16 physiological substrates most prominent for each serine protease.
+
+```{r define-validation-helpers}
+prep_model_df <- function(df_raw, df_z, df_01, df_cutsite, df_merops) {
+  stopifnot(all(c("uniprot","pos") %in% colnames(df_raw)))
+  stopifnot(all(c("uniprot","pos") %in% colnames(df_z)))
+  stopifnot(all(c("uniprot","pos") %in% colnames(df_01)))
+  df_z_suff <- df_z %>%
+    dplyr::rename_with(~ paste0(.x, "_z"), -c(uniprot, pos))
+  df_01_suff <- df_01 %>%
+    dplyr::rename_with(~ paste0(.x, "_01"), -c(uniprot, pos))
+  df <- df_raw %>%
+    dplyr::left_join(df_z_suff,  by = c("uniprot","pos")) %>%
+    dplyr::left_join(df_01_suff, by = c("uniprot","pos")) %>%
+    dplyr::left_join(df_cutsite, by = c("uniprot","pos")) %>%
+    dplyr::left_join(df_merops,  by = c("uniprot","pos")) %>%
+    dplyr::mutate(
+      cleaved = dplyr::if_else(
+        !is.na(cleavage_type) & cleavage_type %in% c("P","N"),
+        1L, 0L
+      )
+    ) %>%
+    dplyr::select(-any_of(c( "row_id", ".row_id", "row_id_z", ".row_id_z", "row_id_01", ".row_id_01" )))
+  stopifnot(nrow(df) == nrow(df_raw))
+
+  df
+}
+
+prep_model_df_01 <- function(df_01, df_cutsite, df_merops) {
+  stopifnot(all(c("uniprot","pos") %in% colnames(df_01)))
+  df_01_suff <- df_01 %>%
+    dplyr::rename_with(~ paste0(.x, "_01"), -c(uniprot, pos))
+  df <- df_01_suff %>%
+    dplyr::left_join(df_cutsite, by = c("uniprot","pos")) %>%
+    dplyr::left_join(df_merops,  by = c("uniprot","pos")) %>%
+    dplyr::mutate(
+      cleaved = dplyr::if_else(
+        !is.na(cleavage_type) & cleavage_type %in% c("P","N"),
+        1L, 0L
+      )
+    ) %>%
+    dplyr::select(-any_of(c( "row_id", ".row_id", "row_id_z", ".row_id_z", "row_id_01", ".row_id_01" )))
+  stopifnot(nrow(df) == nrow(df_raw))
+
+  df
+}
+
+select_and_prefix <- function(df, prefix) {df %>%
+    dplyr::select(uniprot, pos, where(is.numeric)) %>%
+    dplyr::rename_with(~ paste0(prefix, .x),-c(uniprot, pos))
+}
+
+protease_map <- list(
+  "cathepsin G" = c("P00742", "P12259", #coag
+                    "P25116", "Q96RI0", #pars
+                    "P07359", #platelet
+                    "P01024", "P05546", #C3, cofactor 2
+                    "P10147", "P16619", "P48061", "Q16663", "P01584"
+                    ),
+  "elastase"   = c("P12259", "P00740", "P01008", 
+                   "P01024", "P05546",
+                   "P02751", "P02461", "P06870", "P16112", "Q13753", "P45452", "P60709", "P19957")
+)
+
+protease_map <- list(
+  "cathepsin G" = c("P00742", "P12259", #coag
+                    "P25116","P48061"),
+  "elastase"   = c("P12259", "P00740", "P02461", "P16112")
+)
+
+substrate_name_map <- c(
+  "P00742" = "Coag factor X",
+  "P12259" = "Coag factor V",
+  "P00740" = "Coag factor IX",
+  "P01008" = "Antithrombin III",
+  "P25116" = "PAR-1",
+  "Q96RI0" = "PAR-4",
+  "P07359" = "GP1BA",
+
+  # complement / inhibitors
+  "P01024" = "Complement C3",
+  "P05546" = "Heparin cofactor II",
+
+  # chemokines / cytokines
+  "P10147" = "CCL3",
+  "P16619" = "CCL3-like 1",
+  "P48061" = "CXCL12",
+  "Q16663" = "C-C motif chemokine 15",
+  "P01584" = "Interleukin-1β precursor",
+
+  # elastase / ECM / plasma proteins
+  "P02751" = "Fibronectin",
+  "P02461" = "Collagen alpha-1(III)",
+  "P06870" = "Apolipoprotein A-II",
+  "P16112" = "Aggregan core protein",
+  "Q13753" = "LAMC2",
+  "P45452" = "MMP-13",
+  "P60709" = "Actin, cytoplasmic 1",
+  "P19957" = 'Elafin'
+
+)
+```
+
+
+
+For each cut score method, we plot the distribution of cut scores and label the score of the cut site.
+
+Compare phage cut scores at known MEROPS sites (colored) versus all other sites on the same proteins (grey). Subgroups include physiological vs non-physiological sites and secondary structure at the cut (Appendix S7–S9):
+
+```{r plot-known-site-score-dists}
+score_col <- "pwm_relaxed_unaligned_01"
+score_name <- "Sig peptides (PWM; relaxed unaligned) (0 to 1)"
+  
+score_cols <- c("pwm_deseq2_01", "pwm_relaxed_unaligned_01", "pwm_relaxed_aligned_01", "pep_deseq2_01", "pep_relaxed_unaligned_01", "pep_relaxed_aligned_01")
+score_names <- c("DESeq2 (PWM) (0 to 1)", "Sig peptides (PWM; relaxed unaligned) (0 to 1)", "Sig peptides (PWM; relaxed aligned) (0 to 1)", "DESeq2 (peptides) (0 to 1)", "Sig peptides (peptides; relaxed unaligned) (0 to 1)", "Sig peptides (peptides; relaxed aligned) (0 to 1)")
+  
+for (i in seq_along(proteases)) {
+  i = 1
+  substrates <- protease_map[[ combined[i] ]]
+  dir_in <- paste0("F:/Alphafold Phage Project/", combined[i])
+  df_raw <- read.csv( paste0(dir_in, "/", combined[i], "_all_cut_scores.csv"), stringsAsFactors = FALSE )
+  df_z <- read.csv( paste0(dir_in, "/", combined[i], "_all_cut_scores_z.csv"), stringsAsFactors = FALSE )
+  df_01 <- read.csv( paste0(dir_in, "/", combined[i], "_all_cut_scores_01.csv"), stringsAsFactors = FALSE )
+  df_merops <- read.csv( paste0(combined[i], "_merops_mapped.csv"), stringsAsFactors = FALSE, skip = 1 ) %>%   transmute(uniprot, substrate, pos = P1_position, cleavage_type = cleavage_type, is_merops = TRUE) 
+  df_merops <- df_merops %>% group_by(uniprot, pos) %>% summarise(substrate     = dplyr::first(substrate),cleavage_type = paste(sort(unique(cleavage_type)), collapse = "/"), is_merops = TRUE,.groups = "drop")
+  df_model <- prep_model_df(df_raw, df_z, df_01, df_cutsite, df_merops)
+  
+  df_dist_all <- bind_rows(lapply(substrates, function(uid) {
+  df_model %>%
+    filter(uniprot == uid) %>%
+    mutate(uid = uid)
+  }))
+  
+  df_bg_long <- df_model %>%
+  dplyr::select(uniprot, pos, all_of(score_cols)) %>%
+  tidyr::pivot_longer(
+    cols = all_of(score_cols),
+    names_to = "score_col",
+    values_to = "score"
+  ) %>%
+  mutate(score_name = factor(score_col, levels = score_cols, labels = score_names)) %>%
+  filter(!is.na(score))
+  bg_meds <- df_bg_long %>%
+  group_by(score_name) %>%
+  summarise(bg_med = median(score, na.rm = TRUE), .groups = "drop")
+
+  hit_meds <- df_long %>%
+  group_by(score_name) %>%
+  summarise(hit_med = median(score, na.rm = TRUE), .groups = "drop")
+
+  df_delta <- hit_meds %>%
+  left_join(bg_meds, by = "score_name") %>%
+  mutate(delta_med = hit_med - bg_med) %>%
+  mutate(label = paste0("ΔMed: ", sprintf("%.3f", delta_med)))
+  
+  
+  df_cuts_all <- bind_rows(lapply(substrates, function(uid) {
+    df_merops %>%
+      dplyr::select(uniprot, pos, substrate, cleavage_type) %>%
+      filter(uniprot == uid) %>%
+      left_join(
+        df_model %>% dplyr::select(uniprot, pos, all_of(score_col), SS_P1),
+        by = c("uniprot", "pos")
+      ) %>%
+      filter(!is.na(.data[[score_col]])) %>%
+      mutate(
+        uid = uid,
+        phys = dplyr::if_else( cleavage_type == "P", "P", "Non-P", missing = "Non-P" )
+        #phys = ifelse(cleavage_type == "P", "P", "Non-P")
+      )
+  }))
+
+  ggplot(df_dist_all, aes(x = .data[[score_col]])) +
+    geom_histogram(bins = 30, fill = "grey80", color = "black") +
+    geom_vline(
+      data = df_cuts_all,
+      aes(xintercept = .data[[score_col]], color = SS_P1),
+      #aes(xintercept = .data[[score_col]], color = phys),
+      linetype = "dashed",
+      linewidth = 0.7
+    ) +
+    geom_text(
+      data = df_cuts_all,
+      aes(
+        x = .data[[score_col]],
+        y = Inf,
+        label = paste0(pos, " (", phys, ")")
+      ),
+      angle = 45,
+      vjust = 1.2,
+      hjust = 1,
+      size = 2
+    ) +
+    facet_wrap(~ uid, nrow = 2, scales = "free_y",  labeller = labeller(uid = as_labeller(substrate_name_map))) +
+    #scale_color_manual(values = c("P" = "#2166ac","Non-P" = "#b2182b")) +
+    scale_color_manual( values = c( "helix" = "#2166ac", "sheet" = "#1b9e77", "loop" = "#b2182b" ) ) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+    labs(
+      x = score_name,
+      y = "Counts",
+      color = "Cleavage type",
+      title = combined[i]
+    ) +
+    theme_bw(base_size = 12)
+  
+  
+  df_cuts_all <- df_merops %>%
+  left_join(
+    df_model %>% dplyr::select(uniprot, pos, SS_P1, all_of(score_cols)),
+    by = c("uniprot","pos")
+  ) %>%
+  mutate(
+    phys = ifelse(grepl("P", cleavage_type), "Physiological", "Non-physiological")
+  )
+  df_long <- df_cuts_all %>%
+  tidyr::pivot_longer(
+    cols = all_of(score_cols),
+    names_to = "score_col",
+    values_to = "score"
+  ) %>%
+  mutate(score_name = factor(score_col, levels = score_cols, labels = score_names)) %>%
+  filter(!is.na(score))
+  df_long <- df_cuts_all %>%
+  tidyr::pivot_longer(
+    cols = all_of(score_cols),
+    names_to = "score_col",
+    values_to = "score"
+  ) %>%
+  mutate(score_name = factor(score_col, levels = score_cols, labels = score_names)) %>%
+  filter(!is.na(score))
+  
+  bg_meds <- df_bg_long %>%
+  group_by(score_name) %>%
+  summarise(bg_med = median(score, na.rm = TRUE), .groups = "drop")
+
+  cat_meds <- df_long %>%
+  mutate(short_phys = ifelse(phys == "Physiological", "P", "Non-P")) %>%
+  group_by(score_name, short_phys) %>%
+  summarise(cat_med = median(score, na.rm = TRUE), .groups = "drop") %>%
+  left_join(bg_meds, by = "score_name") %>%
+  mutate(delta_med = cat_med - bg_med)
+
+  df_labels <- cat_meds %>%
+  mutate(label_part = paste0(short_phys, ": ", sprintf("%.3f", delta_med))) %>%
+  group_by(score_name) %>%
+  summarise(label = paste0("Δ Median\n", paste(label_part, collapse = "\n ")), .groups = "drop")
+  
+  ggplot() +
+  geom_density(
+    data = df_bg_long, 
+    aes(x = score), 
+    fill = "grey85", color = NA, alpha = 0.9
+  ) +
+  
+  geom_density(
+    data = df_long, 
+    aes(x = score, color = phys), 
+    linewidth = 1.1, adjust = 1.2
+  ) +
+  geom_text(
+    data = df_labels,
+    aes(x = -Inf, y = Inf, label = label),
+    hjust = -0.1, vjust = 1.2,
+    size = 2.5, fontface = "bold", lineheight = 0.9, inherit.aes = FALSE
+  ) +
+  facet_wrap(~ score_name, ncol = 6, scales = "free") +
+  scale_color_manual(values = c(
+    "Physiological" = "#2166ac",
+    "Non-physiological" = "#b2182b"
+  )) +
+  labs(
+    x = "Cleavage score",
+    y = "Density",
+    color = "Cleavage type",
+    title = combined[i]
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+  legend.position = "top",
+  strip.text = element_text(size = 7),
+  plot.margin = margin(5.5, 20, 5.5, 5.5)
+)
+  
+  bg_meds <- df_bg_long %>%
+  group_by(score_name) %>%
+  summarise(bg_med = median(score, na.rm = TRUE), .groups = "drop")
+
+  ss_meds <- df_long %>%
+  group_by(score_name, SS_P1) %>%
+  summarise(cat_med = median(score, na.rm = TRUE), .groups = "drop") %>%
+  left_join(bg_meds, by = "score_name") %>%
+  mutate(delta_med = cat_med - bg_med)
+
+  df_ss_labels <- ss_meds %>%
+  mutate(ss_abbr = case_when(
+    SS_P1 == "helix" ~ "H",
+    SS_P1 == "sheet" ~ "S",
+    SS_P1 == "loop"  ~ "L",
+    TRUE ~ SS_P1
+  )) %>%
+  mutate(label_part = paste0(ss_abbr, ": ", sprintf("%.3f", delta_med))) %>%
+  group_by(score_name) %>%
+  summarise(label = paste0("Δ Median\n", paste(label_part, collapse = "\n")), .groups = "drop")
+
+  p <- ggplot() +
+  geom_density(
+    data = df_bg_long, 
+    aes(x = score), 
+    fill = "grey85", color = NA, alpha = 0.9
+  ) +
+  geom_density(
+    data = df_long, 
+    aes(x = score, color = SS_P1), 
+    linewidth = 1.1, adjust = 1.2
+  ) +
+  geom_text(
+    data = df_ss_labels,
+    aes(x = -Inf, y = Inf, label = label),
+    hjust = -0.1, vjust = 1.1, 
+    size = 2.5, 
+    fontface = "bold", 
+    lineheight = 0.8, 
+    inherit.aes = FALSE
+  ) +
+  facet_wrap(~ score_name, ncol = 6, scales = "free") +
+  scale_color_manual(
+    values = c(
+      "helix" = "#2166ac", 
+      "sheet" = "#1b9e77", 
+      "loop"  = "#b2182b"
+    )
+  ) +
+  labs(
+    x = "Cleavage score",
+    y = "Density",
+    color = "Secondary Structure",
+    title = paste(combined[i], "- Structural Shift Analysis")
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    legend.position = "top",
+    strip.text = element_text(size = 7, face = "bold"),
+    plot.margin = margin(5.5, 20, 5.5, 5.5)
+  ) %>% suppressWarnings()
+  save_fig(p, paste0(gsub(" ", "_", combined[i]), "_structural_shift"), width = 12, height = 8)
+  
+  total_counts <- df_long %>%
+  group_by(score_name) %>%
+  summarise(total_n = n(), .groups = "drop")
+  ss_summary_table <- df_long %>%
+  group_by(score_name, SS_P1) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  left_join(total_counts, by = "score_name") %>%
+  mutate(percentage = (n / total_n) * 100) %>%
+  arrange(score_name, desc(n))
+  print(ss_summary_table)
+}
+
+```
+  
+#### Testing of PWM Validity
+  
+As a subsequent test for PWM validity, and comparing between PWMs, we constructed 10,000 random PWMs and compared their performance to the ones identified from our phage display experiment. We used all known cut sites as benchmarks and assessed our PWM's percentile in the calculated mean match score.
+
+Define random PWM generators and scoring helpers for the null distribution (eval = FALSE if precomputed):
+
+```{r setup-pwm-null-models, eval = FALSE}
+AA <- c("A","C","D","E","F","G","H","I","K","L",
+        "M","N","P","Q","R","S","T","V","W","Y")
+aa_index <- setNames(seq_along(AA), AA)
+score_all_pwms_9mer <- function(seq_idx, pwm_array) {
+  L <- length(seq_idx)
+  N <- dim(pwm_array)[3]
+  scores <- matrix(NA_real_, L, N)
+  for (b in 1:L) {
+    cols <- (b - 4):(b + 4)
+    valid <- cols >= 1 & cols <= L
+    if (!any(valid)) next
+    aa <- seq_idx[cols[valid]]
+    pwm_col <- which(valid)
+    s <- numeric(N)
+    for (i in seq_along(aa)) {
+      s <- s + pwm_array[aa[i], pwm_col[i], ]
+    }
+    scores[b, ] <- s
+  }
+  scores
+}
+
+score_all_pwms_5mer <- function(seq_idx, pwm_array) {
+  L <- length(seq_idx)
+  N <- dim(pwm_array)[3]
+  starts <- 1:(L - 4)
+  window_scores <- matrix(0, length(starts), N)
+  for (i in 1:5) {
+    aa <- seq_idx[starts + i - 1]
+    for (j in seq_along(aa)) {
+      window_scores[j, ] <- window_scores[j, ] +
+        pwm_array[aa[j], i, ]
+    }
+  }
+  out <- matrix(NA_real_, L, N)
+  for (b in 1:L) {
+    idx <- intersect((b - 3):b, starts)
+    if (length(idx)) {
+      out[b, ] <- colMeans(window_scores[idx, , drop = FALSE])
+    }
+  }
+  out
+}
+
+score_merops_pwms_fast <- function(
+  df_merops,
+  pwms,
+  pwm_names,
+  block_size = 500
+) {
+  stopifnot(length(pwms) == length(pwm_names))
+  k_vals <- vapply(pwms, ncol, integer(1))
+  idx_5 <- which(k_vals == 5)
+  idx_9 <- which(k_vals == 9)
+
+  pwm5_array <- if (length(idx_5))
+    simplify2array(pwms[idx_5]) else NULL
+  pwm9_array <- if (length(idx_9))
+    simplify2array(pwms[idx_9]) else NULL
+
+  out <- list()
+  out_i <- 1
+
+  for (uid in unique(df_merops$uniprot)) {
+    print(uid)
+    row <- pdb_subset[pdb_subset[,2] == uid, ]
+    protein_name <- row[1,1]
+    pdb_path <- file.path("F:/Enoch/PDBs/", paste0(protein_name, "_", uid, ".pdb"))
+    if (!file.exists(pdb_path)) next
+
+    pdb <- bio3d::read.pdb(pdb_path)
+    seq <- paste(bio3d::pdbseq(pdb), collapse = "")
+    cut_positions <- df_merops$pos[df_merops$uniprot == uid]
+    sp <- get_signal_peptide_position(uid)
+    if (!is.null(sp)) {
+      seq <- substring(seq, sp$end + 1)
+      cut_positions <- cut_positions - sp$end
+    }
+      
+    seq_idx <- aa_index[strsplit(seq, "")[[1]]]
+    L <- length(seq_idx)
+    cut_positions <- cut_positions[
+    cut_positions >= 1 & cut_positions <= L
+    ]
+
+if (!length(cut_positions)) next
+    if (length(idx_5)) {
+      for (blk in split(seq_along(idx_5),
+                        ceiling(seq_along(idx_5) / block_size))) {
+        scores <- score_all_pwms_5mer(
+          seq_idx,
+          pwm5_array[,,blk, drop = FALSE]
+        )
+        mins <- apply(scores, 2, min, na.rm = TRUE)
+        maxs <- apply(scores, 2, max, na.rm = TRUE)
+        for (p in cut_positions) {
+          raw <- scores[p, ]
+          out[[out_i]] <- data.frame(
+            uniprot = uid,
+            pos = p,
+            pwm = pwm_names[idx_5][blk],
+            raw_score = raw,
+            min_score = mins,
+            max_score = maxs,
+            score_01 = (raw - mins) / (maxs - mins)
+          )
+          out_i <- out_i + 1
+        }
+      }
+    }
+    if (length(idx_9)) {
+
+      for (blk in split(seq_along(idx_9),
+                        ceiling(seq_along(idx_9) / block_size))) {
+        scores <- score_all_pwms_9mer(
+          seq_idx,
+          pwm9_array[,,blk, drop = FALSE]
+        )
+        mins <- apply(scores, 2, min, na.rm = TRUE)
+        maxs <- apply(scores, 2, max, na.rm = TRUE)
+
+        for (p in cut_positions) {
+          raw <- scores[p, ]
+          out[[out_i]] <- data.frame(
+            uniprot = uid,
+            pos = p,
+            pwm = pwm_names[idx_9][blk],
+            raw_score = raw,
+            min_score = mins,
+            max_score = maxs,
+            score_01 = (raw - mins) / (maxs - mins)
+          )
+          out_i <- out_i + 1
+        }
+      }
+    }
+  }
+
+  dplyr::bind_rows(out)
+}
+
+generate_random_pwm <- function(k) {
+  aa <- c("A","C","D","E","F","G","H","I","K","L",
+          "M","N","P","Q","R","S","T","V","W","Y")
+  pwm <- matrix(runif(k * length(aa)), nrow = length(aa))
+  pwm <- pwm / rowSums(pwm)
+  rownames(pwm) <- aa
+  colnames(pwm) <- paste0(seq_len(k))
+  pwm
+}
+
+set.seed(123)
+
+pwms_5mer <- lapply(1:10000, function(i) generate_random_pwm(5))
+pwms_9mer <- lapply(1:10000, function(i) generate_random_pwm(9))
+
+pwms <- c(pwms_5mer, pwms_9mer)
+pwm_names <- c(
+  paste0("rand5_", 1:10000),
+  paste0("rand9_", 1:10000)
+)
+
+for (i in seq_along(proteases)) {
+  df_merops <- read.csv( paste0(combined[i], "_merops_mapped.csv"), stringsAsFactors = FALSE, skip = 1 ) %>%   transmute(uniprot, substrate, pos = P1_position, cleavage_type = cleavage_type, is_merops = TRUE) 
+  df_merops <- df_merops %>% group_by(uniprot, pos) %>% summarise(substrate     = dplyr::first(substrate),cleavage_type = paste(sort(unique(cleavage_type)), collapse = "/"), is_merops = TRUE,.groups = "drop")
+  
+df_pwm_scores <- score_merops_pwms_fast(
+  df_merops = df_merops,
+  pwms = pwms,
+  pwm_names = pwm_names
+)
+  write.csv(df_pwm_scores,paste0(combined[i], "_merops_random_pwm_scores_5mer_9mer.csv"),row.names = FALSE) #_9mer
+}
+```
+
+We compared the performance of these 10,000 random PWMs in scoring individual proteins, and all cleaved proteins for a protease (mean PWM score).
+
+Compare phage-derived PWM mean scores on MEROPS sites against 10,000 random PWMs and label empirical percentiles (Appendix S10):
+
+```{r plot-pwm-null-validation}
+for (i in seq_along(proteases)) {
+  dir_in <- paste0("F:/Alphafold Phage Project/", combined[i])
+  df_raw <- read.csv( paste0(dir_in, "/", combined[i], "_all_cut_scores.csv"), stringsAsFactors = FALSE )
+  df_z <- read.csv( paste0(dir_in, "/", combined[i], "_all_cut_scores_z.csv"), stringsAsFactors = FALSE )
+  df_01 <- read.csv( paste0(dir_in, "/", combined[i], "_all_cut_scores_01.csv"), stringsAsFactors = FALSE )
+  df_merops <- read.csv( paste0(combined[i], "_merops_mapped.csv"), stringsAsFactors = FALSE, skip = 1 ) %>%   transmute(uniprot, substrate, pos = P1_position, cleavage_type = cleavage_type, is_merops = TRUE) 
+  df_merops <- df_merops %>% group_by(uniprot, pos) %>% summarise(substrate     = dplyr::first(substrate),cleavage_type = paste(sort(unique(cleavage_type)), collapse = "/"), is_merops = TRUE,.groups = "drop")
+  df_model <- prep_model_df(df_raw, df_z, df_01, df_cutsite, df_merops)
+  df_pwm_scores <- read.csv( paste0(combined[i], "_merops_random_pwm_scores_5mer_9mer.csv"), stringsAsFactors = FALSE )
+  
+  sp_table <- df_merops %>% distinct(uniprot) %>% rowwise() %>% mutate(sp_end = {sp <- get_signal_peptide_position(uniprot)
+      if (is.null(sp) || is.na(sp$end)) 0 else sp$end} ) %>% ungroup()
+  df_pwm_scores <- df_pwm_scores %>% left_join(sp_table, by = "uniprot") %>% mutate( pos = pos + sp_end ) %>% filter(pos >= 1) %>% dplyr::select(-sp_end)
+  null_means_9mer <- df_pwm_scores %>%
+  filter(grepl("^rand9", pwm)) %>%
+  group_by(pwm) %>%
+  summarise(
+    mean_score = mean(score_01, na.rm = TRUE),
+    n_sites = sum(!is.na(score_01)),
+    .groups = "drop" 
+  ) #csg = 261
+  
+  null_means_5mer <- df_pwm_scores %>%
+  filter(grepl("^rand5", pwm)) %>%
+  group_by(pwm) %>%
+  summarise(
+    mean_score = mean(score_01, na.rm = TRUE),
+    n_sites = sum(!is.na(score_01)),
+    .groups = "drop"
+  ) #261
+  
+  model_cols_aligned <- c("pwm_relaxed_aligned_01")
+  model_cols_unaligned <- c("pwm_deseq2_01", "pwm_relaxed_unaligned_01")
+
+  model_means_aligned <- df_merops %>% dplyr::select(uniprot, pos) %>% dplyr::left_join( df_model %>% dplyr::select(uniprot, pos, all_of(model_cols_aligned)), by = c("uniprot", "pos") ) %>% tidyr::pivot_longer( cols = all_of(model_cols_aligned), names_to = "model", values_to = "score" ) %>% dplyr::filter(!is.na(score)) %>% dplyr::group_by(model) %>% dplyr::summarise( mean_score = mean(score), n_sites = n(), .groups = "drop" )
+  model_means_aligned <- model_means_aligned %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(percentile = mean(null_means_9mer$mean_score < mean_score))
+  model_means_unaligned <- df_merops %>% dplyr::select(uniprot, pos) %>% dplyr::left_join( df_model %>% dplyr::select(uniprot, pos, all_of(model_cols_unaligned)), by = c("uniprot", "pos") ) %>% tidyr::pivot_longer( cols = all_of(model_cols_unaligned), names_to = "model", values_to = "score" ) %>% dplyr::filter(!is.na(score)) %>% dplyr::group_by(model) %>% dplyr::summarise( mean_score = mean(score), n_sites = n(), .groups = "drop" )
+  model_means_unaligned <- model_means_unaligned %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(percentile = mean(null_means_5mer$mean_score < mean_score))
+  
+  lis <- list(null_means_9mer, null_means_5mer)
+  lis2 <- list(model_means_aligned, model_means_unaligned)
+  
+  #1) look at df_merops. for each substrate, figure out cut site with highest score mean (across all). 
+  #2) look at df_pwm_scores. 
+  
+  
+  df_model_cuts_all <- df_merops %>% dplyr::select(uniprot, pos) %>% dplyr::left_join( df_model %>% dplyr::select( uniprot, pos, pwm_deseq2_01, pwm_relaxed_unaligned_01, pwm_relaxed_aligned_01 ), by = c("uniprot", "pos") ) %>% tidyr::pivot_longer( cols = starts_with("pwm_"), names_to = "model", values_to = "score_01" ) %>% dplyr::filter(!is.na(score_01))
+  df_model_best_site <- df_model_cuts_all %>%
+  group_by(uniprot, pos) %>%
+  summarise(
+    mean_model_score = mean(score_01, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  group_by(uniprot) %>%
+  slice_max(mean_model_score, n = 1, with_ties = FALSE) %>%
+  dplyr::select(uniprot, pos)
+  
+  df_model_cuts_best <- df_model_cuts_all %>%
+  inner_join(df_model_best_site, by = c("uniprot", "pos"))
+ 
+  
+  df_pwm_scores_best <- df_pwm_scores %>%
+  inner_join(df_model_best_site, by = c("uniprot", "pos"))
+  
+  lis_null <- list(
+  df_pwm_scores_best %>% dplyr::filter(grepl("^rand9", pwm)),
+  df_pwm_scores_best %>% dplyr::filter(grepl("^rand5", pwm))
+  )
+  
+  
+  add_percentile <- function(df_model, kmer) {
+    df_null <- df_pwm_scores %>%
+    dplyr::filter(grepl(paste0("^rand", kmer), pwm))
+    df_model %>%
+    dplyr::rowwise() %>%
+    dplyr::mutate(percentile = mean(
+        df_null$score_01[df_null$uniprot == uniprot] < score_01, na.rm = TRUE)) %>% dplyr::ungroup()}
+  lis_model <- list(add_percentile( df_model_cuts_best %>% dplyr::filter(model %in% c("pwm_relaxed_aligned_01")), kmer = 9 ), add_percentile( df_model_cuts_best %>% dplyr::filter(model %in% c("pwm_relaxed_unaligned_01", "pwm_deseq2_01")), kmer = 5 ))
+  
+  for (j in seq_along(lis)) {
+    n_sites <- unique(lis2[[j]]$n_sites)
+    plot <- ggplot(lis[[j]], aes(x = mean_score)) +
+    geom_histogram(bins = 60, fill = "grey80", color = "black") +
+    geom_vline(data = lis2[[j]], aes(xintercept = mean_score, color = model), linewidth = 1.2, show.legend = TRUE) +
+    geom_text(data = lis2[[j]], aes(x = mean_score, y = Inf, label = scales::percent(percentile, accuracy = 0.1), color = model), vjust = 1.4, size = 5, show.legend = FALSE) +
+    scale_color_manual(
+      name = "PWM",
+      values = c(
+        pwm_deseq2_01 = "#000000",
+        pwm_relaxed_unaligned_01 = "#ef8a62",
+        pwm_relaxed_aligned_01 = "#1b9e77"
+      ),
+      labels = c(
+        pwm_deseq2_01 = "DESeq2 (PWM) (0 to 1)",
+        pwm_relaxed_unaligned_01 = "Sig peptides (PWM; relaxed unaligned) (0 to 1)",
+        pwm_relaxed_aligned_01 = "Sig peptides (PWM; relaxed aligned) (0 to 1)"
+      )
+    ) +
+    labs(x = paste0( "Mean PWM score (n = ", n_sites, " MEROPs sites)"),
+         y = "Number of random PWMs",
+         title = c("9-mer PWMs", "5-mer PWMs")[j]) +
+    theme_bw(base_size = 12) +
+     theme(
+    legend.position = "bottom",
+    legend.title = element_text(size = 10),
+    legend.text  = element_text(size = 9)
+    )
+    ggsave(
+      filename = file.path("figures", paste0(gsub(" ", "_", combined[i]), "_pwm_null_plot_", j, ".png")),
+      plot = plot, width = 7, height = 5, units = "in", dpi = 150
+    )
+    knitr::include_graphics(
+      file.path("figures", paste0(gsub(" ", "_", combined[i]), "_pwm_null_plot_", j, ".png"))
+    )
+  
+    score_cols <- c("pwm_deseq2", "pwm_relaxed_unaligned", "pwm_relaxed_aligned")
+    score_cols_name <- c("DESeq2 (PWM)", "Sig peptides (PWM; relaxed unaligned)", "Sig peptides (PWM; relaxed aligned)")
+    facet_labeller <- function(df) {
+    setNames(
+      paste0(substrate_name_map[df$uniprot], "\nCut site: ", df$pos),
+      df$uniprot
+    )
+    }
+    substrates <- protease_map[[combined[i]]]
+    null_j <- lis_null[[j]] %>% dplyr::filter(uniprot %in% substrates)
+    model_j <- lis_model[[j]] %>% dplyr::filter(uniprot %in% substrates)
+    if (nrow(null_j) == 0 || nrow(model_j) == 0) {
+      message(sprintf(
+        "Skipping per-substrate null plot for %s (panel %d): no overlapping sites after filtering to protease_map substrates.",
+        combined[i], j
+      ))
+      next
+    }
+    plot <- ggplot(null_j, aes(x = score_01)) +
+    geom_histogram(bins = 30, fill = "grey80", color = "black") +
+    geom_vline(
+      data = model_j,
+      aes(xintercept = score_01, color = model),
+      linetype = "dashed", linewidth = 0.7
+    ) +
+    geom_text(
+      data = model_j %>%
+        arrange(score_01) %>%
+        group_by(uniprot) %>%
+        mutate(y_offset = seq_len(n()) * 0.04),
+      aes(
+        x = score_01,
+        y = Inf - y_offset,
+        label = scales::percent(percentile, accuracy = 0.1),
+        color = model
+      ),
+      vjust = 1,
+      size = 2.5,
+      show.legend = FALSE
+    ) +
+    facet_wrap(
+      ~ uniprot,
+      nrow = 4,
+      scales = "free_y",
+      labeller = labeller(uniprot = facet_labeller(model_j))
+    ) +
+    scale_color_manual(
+      name = "PWM",
+      values = c(
+        pwm_relaxed_aligned_01 = "#1b9e77",
+        pwm_relaxed_unaligned_01 = "#ef8a62",
+        pwm_deseq2_01 = "#000000"
+      ),
+      labels = c(
+        pwm_deseq2_01 = "DESeq2 (PWM)",
+        pwm_relaxed_unaligned_01 = "Relaxed unaligned PWM",
+        pwm_relaxed_aligned_01 = "Relaxed aligned PWM"
+      )
+    ) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+    labs(
+      x = "PWM score (0–1)",
+      y = "Number of random PWMs",
+      color = "PWM"
+    ) +
+    theme_bw(base_size = 12) +
+    theme(
+      legend.position = "bottom",
+      strip.text = element_text(size = 8),
+      legend.box = "horizontal"
+    )
+    save_fig(plot, paste0(gsub(" ", "_", combined[i]), "_null_dist_", j), width = 10, height = 6)
+  }
+}
+  
+
+
+```
+
+
+# Modeling and substrate cleavage prediction
+
+We next integrate phage-derived cleavage preferences (PWM / peptide scores) with AlphaFold2 structural features (SASA, pLDDT, packing, etc.) at candidate cut sites.
+
+### Structural context of known cleavage sites
+
+We first compare structural feature distributions at MEROPS-annotated cut sites versus the background of all scored sites on the same proteins (Appendix S15).
+
+
+```{r plot-structural-feature-densities}
+struct_vars <- c( "rSASA_P1", "rSASA_P1p", "mean_rSASA_w", "max_rSASA_w", "pct_exposed_w", "pLDDT_P1", "mean_pLDDT_w", "residue_depth_P1", "neighbors_6A", "neighbors_8A")
+struct_names <- c("relative SASA at P1", "relative SASA at P1'", "mean SASA P4-P4'", "max SASA P4-P4'", "% exposed P4-P4'", 'pLDDT at P1', "mean pLDDT P4-P4'", 'residue depth at P1', 'neighbors in 6A', 'neighbors in 8A')
+prot_cols <- c(
+  "cathepsin G" = "red",
+  "elastase" = "blue"
+)
+
+df_background <- df_cutsite %>%
+  dplyr::select(all_of(struct_vars)) %>%
+  pivot_longer(cols = everything(), names_to = "metric", values_to = "value")
+
+df_hits_list <- list()
+
+for (i in seq_along(proteases)) {
+  prot_name <- proteases[i]
+  df_merops_mapped <- read.csv(paste0(combined[i], "_merops_mapped.csv"), skip = 1) %>%
+    transmute(uniprot, pos = P1_position) %>%
+    distinct() # Remove duplicates
+  df_hits_list[[i]] <- df_merops_mapped %>%
+    inner_join(df_cutsite, by = c("uniprot", "pos")) %>%
+    mutate(protease = prot_name)
+  
+}
+
+df_hits_all <- bind_rows(df_hits_list)
+
+bg_means <- df_cutsite %>%
+  summarise(across(all_of(struct_vars), \(x) median(x, na.rm = TRUE))) %>%
+  pivot_longer(cols = everything(), names_to = "metric", values_to = "bg_median")
+df_stats <- df_hits_all %>%
+  group_by(protease) %>%
+  summarise(across(all_of(struct_vars), \(x) median(x, na.rm = TRUE))) %>%
+  pivot_longer(cols = -protease, names_to = "metric", values_to = "hit_median") %>%
+  left_join(bg_means, by = "metric") %>%
+  mutate(delta_median = hit_median - bg_median)
+
+
+
+name_map <- setNames(struct_names, struct_vars)
+make_metric_row <- function(metric_name, show_titles = FALSE) {
+  bg_data <- df_cutsite %>% dplyr::select(value = !!sym(metric_name))
+  hit_data <- df_hits_all %>% dplyr::select(protease, value = !!sym(metric_name))
+  row_stats <- df_stats %>% filter(metric == metric_name)
+  
+  ggplot() +
+    geom_density(data = bg_data, aes(x = value), fill = "grey85", color = "grey", alpha = 0.9) +
+    geom_density(data = hit_data, aes(x = value, fill = protease, color = protease), alpha = 0.2) +
+    geom_rug(data = hit_data, aes(x = value, color = protease), sides = "b", alpha = 0.2) +
+    geom_text( data = row_stats, aes(label = paste0("Δmedian: ", sprintf("%.2f", delta_median))), x = Inf, y = Inf, hjust = 1.1, vjust = 1.5, size = 2.2, fontface = "bold", inherit.aes = FALSE ) +
+    facet_wrap(~protease, ncol = 2, scales = "free") + 
+    scale_fill_manual(values = prot_cols) +
+    scale_color_manual(values = prot_cols) +
+    theme_classic(base_size = 9) +
+    theme(
+      legend.position = "none",
+      strip.text = if(show_titles) element_text(face = "bold", size = 10) else element_blank(),
+      strip.background = element_blank(),
+      axis.title.x = element_blank(),
+      axis.text.x = element_text(size = 7),
+      axis.text.y = element_text(size = 7), 
+      axis.title.y = element_text(size = 6, face = "bold", angle = 90),
+      plot.margin = margin(t = 1, r = 5, b = 1, l = 5),
+      panel.spacing = unit(1, "lines")
+    ) +
+    labs(y = name_map[metric_name])
+}
+plot_list <- list()
+for (i in seq_along(struct_vars)) {
+  plot_list[[i]] <- make_metric_row(struct_vars[i], show_titles = (i == 1))
+}
+final_plot <- wrap_plots(plot_list, ncol = 1)
+save_fig(final_plot, "structural_feature_densities", width = 10, height = 16)
+
+```
+
+Joint view of phage PWM score versus selected structural metrics for hits and background:
+
+```{r plot-score-vs-structure-2d}
+hits_with_scores_list <- list()
+bg_2d_list   <- list()
+prot_names <- proteases
+for (i in seq_along(proteases)) {
+  dir_in <- paste0("F:/Alphafold Phage Project/", combined[i])
+  df_raw <- read.csv( paste0(dir_in, "/", combined[i], "_all_cut_scores.csv"), stringsAsFactors = FALSE )
+  df_z <- read.csv( paste0(dir_in, "/", combined[i], "_all_cut_scores_z.csv"), stringsAsFactors = FALSE )
+  df_01 <- read.csv( paste0(dir_in, "/", combined[i], "_all_cut_scores_01.csv"), stringsAsFactors = FALSE )
+  df_merops <- read.csv( paste0(combined[i], "_merops_mapped.csv"), stringsAsFactors = FALSE, skip = 1 ) %>%   transmute(uniprot, substrate, pos = P1_position, cleavage_type = cleavage_type, is_merops = TRUE) 
+  df_merops <- df_merops %>% group_by(uniprot, pos) %>% summarise(substrate     = dplyr::first(substrate),cleavage_type = paste(sort(unique(cleavage_type)), collapse = "/"), is_merops = TRUE,.groups = "drop")
+  df_model <- prep_model_df(df_raw, df_z, df_01, df_cutsite, df_merops)
+  
+  bg_2d_list[[i]] <- df_model %>%
+    dplyr::select(pwm_score = pwm_relaxed_unaligned_01, all_of(struct_vars)) %>%
+    filter(!is.na(pwm_score)) %>%
+    slice_sample(n = 5000) %>% 
+    mutate(protease = prot_names[i])
+  
+  hits_with_scores_list[[i]] <- df_model %>%
+    filter(is_merops == TRUE) %>%
+    dplyr::select(
+      uniprot, pos, 
+      pwm_score = pwm_relaxed_unaligned_01, 
+      all_of(struct_vars)
+    ) %>%
+    mutate(protease = prot_names[i])
+}
+
+df_bg_final <- bind_rows(bg_2d_list) %>%
+  pivot_longer(cols = all_of(struct_vars), names_to = "metric", values_to = "struct_val") %>%
+  mutate(metric_label = factor(metric, levels = struct_vars, labels = struct_names))
+
+df_hits_2d_master <- bind_rows(hits_with_scores_list)
+
+df_hits_2d_long <- df_hits_2d_master %>%
+  pivot_longer(
+    cols = all_of(struct_vars),
+    names_to = "metric",
+    values_to = "struct_value"
+  ) %>%
+  mutate(metric_label = factor(metric, levels = struct_vars, labels = struct_names))
+df_corrs <- df_hits_2d_long %>%
+  group_by(metric_label, protease) %>%
+  summarise(
+    r_val = cor(pwm_score, struct_value, method = "spearman", use = "complete.obs"),
+    .groups = "drop"
+  ) %>%
+  mutate(label = paste0("R = ", sprintf("%.2f", r_val)))
+
+df_corr_labels_simple <- df_hits_2d_long %>%
+  group_by(metric_label, protease) %>%
+  summarise(
+    r_val = cor(pwm_score, struct_value, method = "spearman", use = "complete.obs"),
+    .groups = "drop"
+  ) %>%
+  mutate(line = paste0(protease, ": r = ", sprintf("%.2f", r_val))) %>%
+  group_by(metric_label) %>%
+  summarise(
+    final_label = paste(line, collapse = "\n"),
+    .groups = "drop"
+  )
+
+plot <- ggplot() +
+  geom_point(
+    data = df_bg_final, 
+    aes(x = pwm_score, y = struct_val, color = "grey"), 
+    alpha = 1, size = 0.3, stroke = 0
+  ) +
+  geom_point(
+    data = df_hits_2d_long, 
+    aes(x = pwm_score, y = struct_value, color = protease), 
+    alpha = 0.25, size = 2, stroke = 0
+  ) +
+  geom_smooth(
+    data = df_hits_2d_long, 
+    aes(x = pwm_score, y = struct_value, color = protease),
+    method = "lm", formula = y ~ x, se = FALSE, linewidth = 0.8, linetype = "dashed"
+  ) +
+
+  geom_text(
+    data = df_corr_labels_simple,
+    aes(x = -Inf, y = Inf, label = final_label),
+    hjust = -0.1, 
+    vjust = 1.2,   
+    size = 2, 
+    fontface = "bold",
+    lineheight = 0.9, 
+    inherit.aes = FALSE
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.2))) + 
+  
+  facet_wrap(~ metric_label, scales = "free_y", ncol = 2) +
+  scale_color_manual(values = prot_cols) +
+  labs(
+    title = "Sequence vs. Structure: 2D Distribution of MEROPS Hits",
+    subtitle = "Grey fill = Background; R = Spearman Correlation",
+    x = "Sequence Score (PWM: 0 to 1)",
+    y = "Structural Metric Value",
+    color = "Protease"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    legend.position = "top",
+    strip.text = element_text(face = "bold", size = 9),
+    panel.grid.minor = element_blank()
+  )
+save_fig(plot, "score_vs_structure_2d", width = 12, height = 8)
+```
+
+
+
+
+For each feature, convert MEROPS-site values to percentiles relative to background and summarize (Appendix S15):
+
+```{r feature-percentile-heatmap}
+pwm_vars <- c(
+  "pwm_deseq2_01",
+  "pwm_relaxed_unaligned_01",
+  "pwm_relaxed_aligned_01",
+  "pep_deseq2_01",
+  "pep_relaxed_unaligned_01",
+  "pep_relaxed_aligned_01"
+)
+pwm_labels <- c(
+  pwm_deseq2_01 = "PWM (DESeq2)",
+  pwm_relaxed_unaligned_01 = "PWM (relaxed unaligned)",
+  pwm_relaxed_aligned_01 = "PWM (relaxed aligned)",
+  pep_deseq2_01 = "Peptide Profile (DESeq2)",
+  pep_relaxed_unaligned_01 = "Pep Profile (relaxed unaligned)",
+  pep_relaxed_aligned_01 = "Pep Profile (relaxed aligned)"
+)
+target_columns <- c(struct_vars, pwm_vars)
+
+struct_labeller <- setNames(struct_names, struct_vars)
+
+heatmap_data_list <- list()
+for (i in seq_along(proteases)) {
+  dir_in <- paste0("F:/Alphafold Phage Project/", combined[i])
+  df_raw <- read.csv( paste0(dir_in, "/", combined[i], "_all_cut_scores.csv"), stringsAsFactors = FALSE )
+  df_z <- read.csv( paste0(dir_in, "/", combined[i], "_all_cut_scores_z.csv"), stringsAsFactors = FALSE )
+  df_01 <- read.csv( paste0(dir_in, "/", combined[i], "_all_cut_scores_01.csv"), stringsAsFactors = FALSE )
+  df_merops <- read.csv( paste0(combined[i], "_merops_mapped.csv"), stringsAsFactors = FALSE, skip = 1 ) %>%   transmute(uniprot, motif_8mer,  substrate, pos = P1_position, cleavage_type = cleavage_type, is_merops = TRUE) 
+  cat(paste0("Distinct motifs: ", n_distinct(df_merops$motif_8mer), " (Before: ", nrow(df_merops), " | After: ", nrow(distinct(df_merops, motif_8mer)), ")\n"))
+  df_merops <- df_merops %>% distinct(motif_8mer, .keep_all = TRUE)
+  df_merops <- df_merops %>% group_by(uniprot, pos) %>% summarise(substrate     = dplyr::first(substrate),cleavage_type = paste(sort(unique(cleavage_type)), collapse = "/"), is_merops = TRUE,.groups = "drop")
+  df_raw_filtered <- df_raw %>% filter(uniprot %in% df_merops$uniprot)
+  df_model <- prep_model_df(df_raw_filtered, df_z, df_01, df_cutsite, df_merops)
+  df_model_2 <- prep_model_df(df_raw, df_z, df_01, df_cutsite, df_merops)
+  
+  
+  df_hits <- df_model %>% filter(is_merops == TRUE)
+  summarized_stats <- df_hits %>%
+    summarise(across(all_of(target_columns), function(x) {
+      col_name <- cur_column()
+      bg_vals <- df_model[[col_name]]
+      bg_vals <- bg_vals[!is.na(bg_vals)]
+      if(length(bg_vals) == 0) return(NA)
+      percentile_fn <- ecdf(bg_vals)
+      mean(percentile_fn(x), na.rm = TRUE) * 100
+    })) %>%
+    mutate(protease = prot_names[i])
+  
+  heatmap_data_list[[i]] <- summarized_stats
+}
+
+df_heatmap_final <- bind_rows(heatmap_data_list) %>%
+  pivot_longer(-protease, names_to = "metric", values_to = "mean_perc") %>%
+  mutate(category = ifelse(metric %in% struct_vars, "Alphafold2 Structure", "Phage Cleaved Peptide Match"),category = factor(category, levels = c("Phage Cleaved Peptide Match", "Alphafold2 Structure")),protease = factor(protease, levels = rev(proteases))))
+
+p_heat <- ggplot(df_heatmap_final, aes(x = metric, y = protease, fill = mean_perc)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = sprintf("%.2f", mean_perc)), size = 3, fontface = "bold") +
+  scale_fill_gradient2(
+    low = "#2166ac", mid = "#f7f7f7", high = "#b2182b",
+    midpoint = 50, limit = c(0, 100), name = "Mean\nPercentile"
+  ) +
+  facet_wrap(~category, ncol = 1, scales = "free_x") +
+  scale_x_discrete(labels = function(x) {
+    ifelse(x %in% names(struct_labeller), struct_labeller[x],
+    ifelse(x %in% names(pwm_labels), pwm_labels[x], x))
+  }) +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, face = "bold"),
+    axis.title = element_blank(),
+    panel.grid = element_blank(),
+    strip.text = element_text(size = 12, face = "bold")
+  )
+save_fig(p_heat, "feature_percentile_heatmap", width = 14, height = 6)
+
+
+
+
+```
+
+
+As a baseline before machine learning, we evaluated composite PWM / peptide-profile scores with ROC and confusion matrices on the full cut-site landscape and on a balanced 1:1 MEROPS:background subsample (Appendix S11–S14):
+
+```{r pwm-structure-combined-scores}
+comparison_data <- list()
+roc_pr_list <- list()
+method_labels <- c(
+  S1 = "PWM (DESeq2) 0-1",
+  S2 = "PWM (unaligned) 0-1",
+  S3 = "PWM (aligned) 0-1",
+  S4 = "Peptide Profile (DESeq2) 0-1",
+  S5 = "PWM (DESeq2) + PWM (aligned)",
+  S6 = "Peptide Profile (DESeq2) + PWM (aligned)",
+  S7 = "PWM (DESeq2) + PWM (aligned) + Peptide Profile (DESeq2)",
+  S8 = "PWM (DESeq2) * PWM (aligned) * Peptide Profile (DESeq2)"
+)
+
+for (i in seq_along(proteases)) {
+  dir_in <- paste0("F:/Alphafold Phage Project/", combined[i])
+  df_raw <- read.csv(paste0(dir_in, "/", combined[i], "_all_cut_scores.csv"), stringsAsFactors = FALSE)
+  df_z <- read.csv(paste0(dir_in, "/", combined[i], "_all_cut_scores_z.csv"), stringsAsFactors = FALSE)
+  df_01 <- read.csv(paste0(dir_in, "/", combined[i], "_all_cut_scores_01.csv"), stringsAsFactors = FALSE)
+  df_merops <- read.csv(paste0(combined[i], "_merops_mapped.csv"), stringsAsFactors = FALSE, skip = 1) %>%
+    transmute(uniprot, substrate, pos = P1_position, cleavage_type = cleavage_type, is_merops = TRUE)
+  df_merops <- df_merops %>%
+    group_by(uniprot, pos) %>%
+    summarise(
+      substrate = dplyr::first(substrate),
+      cleavage_type = paste(sort(unique(cleavage_type)), collapse = "/"),
+      is_merops = TRUE,
+      .groups = "drop"
+    )
+  df_model <- prep_model_df(df_raw, df_z, df_01, df_cutsite, df_merops)
+
+  df_normalized <- df_model %>%
+    group_by(uniprot) %>%
+    mutate(across(all_of(struct_vars), function(x) {
+      if (all(is.na(x)) || min(x, na.rm = TRUE) == max(x, na.rm = TRUE)) return(x)
+      (x - min(x, na.rm = TRUE)) / (max(x, na.rm = TRUE) - min(x, na.rm = TRUE))
+    })) %>%
+    ungroup()
+
+  df_scored <- df_normalized %>%
+    mutate(
+      S1 = pwm_deseq2_01,
+      S2 = pwm_relaxed_unaligned_01,
+      S3 = pwm_relaxed_aligned_01,
+      S4 = pep_deseq2,
+      S5 = pwm_deseq2_01 + pwm_relaxed_aligned_01,
+      S6 = pep_deseq2_01 + pwm_relaxed_aligned_01,
+      S7 = pwm_deseq2_01 + pwm_relaxed_aligned_01 + pep_deseq2,
+      S8 = pwm_deseq2_01 * pwm_relaxed_aligned_01 * pep_deseq2
+    )
+
+  score_cols <- paste0("S", 1:8)
+  colnames(df_scored)[(ncol(df_scored) - 7):ncol(df_scored)] <- score_cols
+
+  stats <- df_scored %>%
+    filter(is_merops == TRUE) %>%
+    summarise(across(all_of(score_cols), function(x) {
+      bg <- df_scored[[cur_column()]]
+      mean(ecdf(bg[!is.na(bg)])(x), na.rm = TRUE) * 100
+    })) %>%
+    mutate(protease = prot_names[i])
+
+  comparison_data[[i]] <- stats
+
+  roc_pr_list[[i]] <- df_scored %>%
+    dplyr::select(is_merops, all_of(score_cols)) %>%
+    mutate(protease = prot_names[i])
+}
+
+df_heat_compare <- bind_rows(comparison_data) %>%
+  pivot_longer(cols = starts_with("S"), names_to = "method", values_to = "mean_perc")
+df_dist_all <- bind_rows(roc_pr_list) %>%
+  mutate(is_merops = ifelse(is.na(is_merops) | is_merops == FALSE, 0, 1))
+
+create_protease_row <- function(p_name, df_dist, df_heat, labels_map, balanced = FALSE) {
+  df_heat_sub <- df_heat %>% filter(protease == p_name)
+
+  df_p_full <- df_dist %>% filter(protease == p_name) %>% drop_na(starts_with("S"))
+  if (balanced) {
+    hits <- df_p_full %>% filter(is_merops == TRUE)
+    bg <- df_p_full %>% filter(is_merops == FALSE)
+    set.seed(42)
+    bg_sampled <- bg %>% sample_n(nrow(hits))
+    df_p <- bind_rows(hits, bg_sampled)
+  } else {
+    df_p <- df_p_full
+  }
+
+  p1 <- ggplot(df_heat_sub, aes(x = method, y = protease, fill = mean_perc)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = sprintf("%.1f", mean_perc)), size = 3, fontface = "bold") +
+    scale_fill_gradient2(low = "#2166ac", mid = "#f7f7f7", high = "#b2182b", midpoint = 50, limit = c(0, 100)) +
+    scale_x_discrete(labels = labels_map) +
+    theme_minimal(base_size = 9) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none") +
+    labs(x = NULL, y = NULL, title = paste(p_name, ": Mean Percentiles"))
+
+  df_bell <- df_p %>%
+    mutate(is_merops_factor = factor(ifelse(is_merops == TRUE, "Hit", "BG"), levels = c("BG", "Hit"))) %>%
+    pivot_longer(cols = starts_with("S"), names_to = "Method_ID", values_to = "Score") %>%
+    mutate(Method_Label = factor(labels_map[Method_ID], levels = labels_map))
+
+  p2 <- ggplot(df_bell, aes(x = Score, fill = is_merops_factor)) +
+    geom_density(alpha = 0.6, color = "white", linewidth = 0.2) +
+    facet_wrap(~Method_Label, scales = "free", ncol = 8) +
+    scale_fill_manual(values = c("BG" = "grey75", "Hit" = "#e41a1c")) +
+    theme_bw(base_size = 8) +
+    theme(
+      legend.position = "none",
+      strip.background = element_blank(),
+      strip.text = element_blank(),
+      axis.text.y = element_blank(),
+      axis.ticks.y = element_blank(),
+      plot.margin = margin(5, 5, 5, 5)
+    ) +
+    labs(x = "Score", y = "Density")
+
+  perf_plots <- lapply(names(labels_map), function(m_id) {
+    roc_obj <- pROC::roc(df_p$is_merops, df_p[[m_id]], quiet = TRUE)
+    best_coords <- pROC::coords(roc_obj, "best", ret = c("threshold", "tp", "tn", "fp", "fn"), transpose = FALSE)
+    best_threshold <- best_coords$threshold[1]
+    auc_val <- as.numeric(roc_obj$auc)
+
+    p_roc <- ggplot(
+      data.frame(fpr = 1 - roc_obj$specificities, tpr = roc_obj$sensitivities),
+      aes(x = fpr, y = tpr)
+    ) +
+      geom_line(color = "#2166ac", linewidth = 0.8) +
+      geom_abline(linetype = "dashed", color = "grey") +
+      annotate("text", x = 0.5, y = 0.2, label = sprintf("AUC:%.3f", auc_val),
+               size = 2, fontface = "bold") +
+      theme_bw(base_size = 7) +
+      theme(
+        legend.position = "none",
+        strip.background = element_blank(),
+        strip.text = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        plot.margin = margin(5, 5, 5, 5)
+      ) +
+      labs(x = "FPR", y = "TPR")
+
+    cm_df <- data.frame(
+      Actual = factor(c("1", "1", "0", "0"), levels = c("1", "0")),
+      Pred = factor(c("1", "0", "1", "0"), levels = c("1", "0")),
+      Count = as.numeric(c(
+        best_coords$tp[1], best_coords$fn[1],
+        best_coords$fp[1], best_coords$tn[1]
+      ))
+    )
+
+    p_cm <- ggplot(cm_df, aes(x = Pred, y = Actual, fill = Count)) +
+      geom_tile(color = "white") +
+      geom_text(aes(label = Count), size = 2, fontface = "bold") +
+      scale_fill_gradient(low = "white", high = "#4daf4a") +
+      scale_y_discrete(limits = rev) +
+      scale_x_discrete(limits = c("0", "1"), position = "top") +
+      theme_minimal(base_size = 7) +
+      theme(
+        legend.position = "none",
+        axis.title = element_blank(),
+        panel.grid = element_blank(),
+        panel.border = element_rect(color = "black", fill = NA, linewidth = 0.5)
+      ) +
+      labs(title = sprintf("Threshold: %.2f", best_threshold))
+
+    p_roc / p_cm
+  })
+
+  p_perf_grid <- wrap_plots(perf_plots, ncol = 8)
+  wrap_plots(p1, p2, p_perf_grid, ncol = 1, heights = c(0.2, 1, 2))
+}
+
+row_catG <- create_protease_row("cathepsin G", df_dist_all, df_heat_compare, method_labels)
+row_elast <- create_protease_row("elastase", df_dist_all, df_heat_compare, method_labels)
+save_fig(row_catG, "prediction_row_cathepsin_G", width = 14, height = 8)
+save_fig(row_elast, "prediction_row_elastase", width = 14, height = 8)
+
+row_catG_bal <- create_protease_row("cathepsin G", df_dist_all, df_heat_compare, method_labels, balanced = TRUE)
+row_elast_bal <- create_protease_row("elastase", df_dist_all, df_heat_compare, method_labels, balanced = TRUE)
+save_fig(row_catG_bal, "prediction_row_cathepsin_G_balanced", width = 14, height = 8)
+save_fig(row_elast_bal, "prediction_row_elastase_balanced", width = 14, height = 8)
+```
+  
+
+
+# Cleavage-site prediction with XGBoost
+
+We trained one binary XGBoost classifier per protease to distinguish MEROPS cleavage sites from other positions on the same substrates, using phage-derived sequence scores and AlphaFold2 structural features (Appendix S16–S18). Sites with identical 8-mer motifs were collapsed to a single representative before training so near-duplicates do not inflate performance.
+
+Models use fixed hyperparameters: nrounds = 100, max_depth = 6, eta = 0.01, subsample = 0.7, colsample_bytree = 0.7. We report both the natural (unbalanced) landscape and a balanced 1:1 MEROPS:background subsample.
+
+Helper functions for table loading, motif deduplication, feature matrix construction, median imputation, metrics, and plotting:
+
+```{r modeling-helpers}
+# Feature labels
+struct_labeller <- setNames(struct_names, struct_vars)
+
+pwm_labels <- c(
+  pwm_deseq2 = "PWM (DESeq2)",
+  pwm_deseq2_01 = "PWM (DESeq2) (0-1)",
+  pwm_deseq2_z = "PWM (DESeq2) (Z)",
+  pep_deseq2 = "Pep Profile (DESeq2)",
+  pep_deseq2_01 = "Pep Profile (DESeq2) (0-1)",
+  pep_deseq2_z = "Pep Profile (DESeq2) (Z)",
+  pwm_relaxed_aligned = "PWM (Relaxed Aligned)",
+  pwm_relaxed_aligned_01 = "PWM (Relaxed Aligned) (0-1)",
+  pwm_relaxed_aligned_z = "PWM (Relaxed Aligned) (Z)",
+  pwm_relaxed_unaligned = "PWM (Relaxed Unaligned)",
+  pwm_relaxed_unaligned_01 = "PWM (Relaxed Unaligned) (0-1)",
+  pwm_relaxed_unaligned_z = "PWM (Relaxed Unaligned) (Z)",
+  pep_relaxed_aligned = "Pep Profile (Relaxed Aligned)",
+  pep_relaxed_aligned_01 = "Pep Profile (Relaxed Aligned) (0-1)",
+  pep_relaxed_aligned_z = "Pep Profile (Relaxed Aligned) (Z)",
+  pep_relaxed_unaligned = "Pep Profile (Relaxed Unaligned)",
+  pep_relaxed_unaligned_01 = "Pep Profile (Relaxed Unaligned) (0-1)",
+  pep_relaxed_unaligned_z = "Pep Profile (Relaxed Unaligned) (Z)"
+)
+
+load_protease_tables <- function(protease, project_root = "F:/Alphafold Phage Project") {
+  dir_in <- file.path(project_root, protease)
+  list(
+    protease = protease,
+    raw = read.csv(file.path(dir_in, paste0(protease, "_all_cut_scores.csv")), stringsAsFactors = FALSE),
+    z   = read.csv(file.path(dir_in, paste0(protease, "_all_cut_scores_z.csv")), stringsAsFactors = FALSE),
+    o1  = read.csv(file.path(dir_in, paste0(protease, "_all_cut_scores_01.csv")), stringsAsFactors = FALSE),
+    merops = read.csv(paste0(protease, "_merops_mapped.csv"), stringsAsFactors = FALSE, skip = 1) %>%
+      transmute(
+        uniprot,
+        motif_8mer,
+        substrate,
+        pos = P1_position,
+        cleavage_type
+      )
+  )
+}
+
+# Collapse highly similar sites (identical 8-mer motifs) to one row
+dedupe_similar_sites <- function(df_merops) {
+  n0 <- nrow(df_merops)
+  out <- df_merops %>%
+    dplyr::filter(!is.na(motif_8mer), motif_8mer != "") %>%
+    dplyr::distinct(motif_8mer, .keep_all = TRUE) %>%
+    dplyr::group_by(uniprot, pos) %>%
+    dplyr::summarise(
+      substrate = dplyr::first(substrate),
+      cleavage_type = paste(sort(unique(cleavage_type)), collapse = "/"),
+      motif_8mer = dplyr::first(motif_8mer),
+      is_merops = TRUE,
+      .groups = "drop"
+    )
+  message(sprintf(
+    "Similar-site filter: %d MEROPS rows -> %d unique motifs/sites",
+    n0, nrow(out)
+  ))
+  out
+}
+
+build_model_frame <- function(tables, df_cutsite) {
+  df_merops <- dedupe_similar_sites(tables$merops)
+  # Restrict background to MEROPS substrate proteins (same proteins as positives)
+  df_raw_f <- tables$raw %>% dplyr::filter(uniprot %in% df_merops$uniprot)
+  df_model <- prep_model_df(df_raw_f, tables$z, tables$o1, df_cutsite, df_merops)
+  df_model
+}
+
+get_feature_matrix <- function(df) {
+  drop_cols <- c(
+    "protein", "uniprot", "pos", "cleavage_type", "is_merops", "cleaved",
+    ".row_id", "protein.x", "protein.y", "protein_01", "protease", "motif_8mer",
+    "substrate"
+  )
+  X <- df %>%
+    dplyr::select(-dplyr::any_of(drop_cols)) %>%
+    dplyr::select(where(is.numeric))
+  X <- X[, !grepl("strict", names(X), ignore.case = TRUE), drop = FALSE]
+  meta_cols <- intersect(c("uniprot", "pos", "motif_8mer"), names(df))
+  list(X = as.data.frame(X), y = as.integer(df$cleaved), site_meta = df[, meta_cols, drop = FALSE])
+}
+
+impute_median <- function(mat, meds) {
+  for (j in seq_along(meds)) {
+    nas <- is.na(mat[, j])
+    if (any(nas)) mat[nas, j] <- meds[j]
+  }
+  mat
+}
+
+calc_stats <- function(y_true, y_prob, threshold) {
+  y_pred <- ifelse(y_prob >= threshold, 1L, 0L)
+  TP <- sum(y_true == 1 & y_pred == 1)
+  FP <- sum(y_true == 0 & y_pred == 1)
+  FN <- sum(y_true == 1 & y_pred == 0)
+  TN <- sum(y_true == 0 & y_pred == 0)
+  sens <- if ((TP + FN) == 0) 0 else TP / (TP + FN)
+  spec <- if ((TN + FP) == 0) 0 else TN / (TN + FP)
+  prec <- if ((TP + FP) == 0) 0 else TP / (TP + FP)
+  f1   <- if ((prec + sens) == 0) 0 else 2 * prec * sens / (prec + sens)
+  c(sens = sens, spec = spec, prec = prec, f1 = f1)
+}
+
+calc_prc <- function(probs, obs) {
+  df <- data.frame(prob = probs, obs = obs) %>%
+    dplyr::arrange(dplyr::desc(prob)) %>%
+    dplyr::mutate(
+      tpr = cumsum(obs) / sum(obs),
+      prec = cumsum(obs) / dplyr::row_number()
+    )
+  sum(diff(df$tpr) * df$prec[-1], na.rm = TRUE)
+}
+
+get_metrics_xgb <- function(probs, train_probs, y_test, y_train, mod_name, model_obj, balanced = FALSE) {
+  probs <- as.numeric(probs)
+  train_probs <- as.numeric(train_probs)
+  y_test <- as.integer(y_test)
+  y_train <- as.integer(y_train)
+
+  roc_test  <- pROC::roc(y_test, probs, quiet = TRUE)
+  roc_train <- pROC::roc(y_train, train_probs, quiet = TRUE)
+  auc_val   <- as.numeric(roc_test$auc)
+  auc_train <- as.numeric(roc_train$auc)
+
+  thresh <- as.numeric(
+    pROC::coords(roc_test, "best", ret = "threshold", best.method = "youden")$threshold[1]
+  )
+
+  prc_val   <- calc_prc(probs, y_test)
+  prc_train <- calc_prc(train_probs, y_train)
+  baseline_test  <- mean(y_test == 1)
+  baseline_train <- mean(y_train == 1)
+
+  cm_test <- caret::confusionMatrix(
+    factor(ifelse(probs >= thresh, 1, 0), levels = c(0, 1)),
+    factor(y_test, levels = c(0, 1)),
+    positive = "1"
+  )
+  cm_train <- caret::confusionMatrix(
+    factor(ifelse(train_probs >= thresh, 1, 0), levels = c(0, 1)),
+    factor(y_train, levels = c(0, 1)),
+    positive = "1"
+  )
+
+  imp <- NULL
+  if (!is.null(model_obj) && inherits(model_obj, "xgb.Booster")) {
+    imp <- xgboost::xgb.importance(model = model_obj)
+  }
+
+  stats_test  <- calc_stats(y_test, probs, thresh)
+  stats_train <- calc_stats(y_train, train_probs, thresh)
+
+  new_entry <- data.frame(
+    Model = mod_name,
+    Timestamp = Sys.time(),
+    Test_AUC = auc_val,
+    Train_AUC = auc_train,
+    Test_PRC = prc_val,
+    Train_PRC = prc_train,
+    Test_PRC_fold = prc_val / baseline_test,
+    Train_PRC_fold = prc_train / baseline_train,
+    Test_Sens = stats_test["sens"],
+    Test_Spec = stats_test["spec"],
+    Test_Prec = stats_test["prec"],
+    Test_F1 = stats_test["f1"],
+    Train_Sens = stats_train["sens"],
+    Train_Spec = stats_train["spec"],
+    Train_Prec = stats_train["prec"],
+    Train_F1 = stats_train["f1"],
+    Balance = balanced,
+    stringsAsFactors = FALSE
+  )
+  global_metrics <<- rbind(global_metrics, new_entry)
+
+  list(
+    probs = probs,
+    train_probs = train_probs,
+    y_test = y_test,
+    y_train = y_train,
+    auc = auc_val,
+    auc_train = auc_train,
+    prc = prc_val,
+    cm = cm_test,
+    cm_train = cm_train,
+    thresh = thresh,
+    importance = imp,
+    name = mod_name,
+    model = model_obj
+  )
+}
+
+# XGBoost trainer
+run_xgb_pipeline <- function(X, y, protease_name, balanced = FALSE, force_retrain = FALSE) {
+  message("XGBoost: ", protease_name, if (balanced) " [balanced]" else "")
+  suffix <- if (balanced) "_balanced" else ""
+  model_file <- paste0(gsub(" ", "_", protease_name), suffix, "_XGB.rds")
+
+  set.seed(123)
+  y <- as.integer(y)
+  X <- as.data.frame(X)
+
+  # Drop zero-variance columns once on the full matrix (keeps train/test aligned)
+  vars <- vapply(X, function(col) {
+    v <- stats::var(col, na.rm = TRUE)
+    if (is.na(v)) 0 else v
+  }, numeric(1))
+  X <- X[, vars > 0, drop = FALSE]
+
+  if (balanced) {
+    pos_idx <- which(y == 1)
+    neg_idx <- which(y == 0)
+    n_pos <- length(pos_idx)
+    if (length(neg_idx) < n_pos) {
+      warning("Fewer negatives than positives; using all negatives.")
+      sampled_neg <- neg_idx
+    } else {
+      sampled_neg <- sample(neg_idx, n_pos)
+    }
+    keep <- sample(c(pos_idx, sampled_neg))
+    X <- X[keep, , drop = FALSE]
+    y <- y[keep]
+  }
+
+  train_idx <- caret::createDataPartition(factor(y), p = 0.8, list = FALSE)[, 1]
+  X_train <- as.matrix(X[train_idx, , drop = FALSE])
+  X_test  <- as.matrix(X[-train_idx, , drop = FALSE])
+  y_train <- y[train_idx]
+  y_test  <- y[-train_idx]
+
+  keep_cols <- colnames(X_train)[colSums(!is.na(X_train)) > 0]
+  X_train <- X_train[, keep_cols, drop = FALSE]
+  X_test  <- X_test[,  keep_cols, drop = FALSE]
+
+  train_medians <- apply(X_train, 2, median, na.rm = TRUE)
+  X_train <- impute_median(X_train, train_medians)
+  X_test  <- impute_median(X_test, train_medians)
+
+  dtrain <- xgboost::xgb.DMatrix(data = X_train, label = y_train)
+  dtest  <- xgboost::xgb.DMatrix(data = X_test, label = y_test)
+
+  params <- list(
+    objective = "binary:logistic",
+    eval_metric = "auc",
+    eta = 0.01,
+    max_depth = 6,
+    subsample = 0.7,
+    colsample_bytree = 0.7
+  )
+
+  if (!force_retrain && file.exists(model_file)) {
+    message("Loading cached model: ", model_file)
+    xgb_model <- readRDS(model_file)
+  } else {
+    message("Training XGBoost (", model_file, ")")
+    xgb_model <- xgboost::xgb.train(
+      params = params,
+      data = dtrain,
+      nrounds = 100,
+      verbose = 0
+    )
+    saveRDS(xgb_model, model_file)
+  }
+
+  probs_test  <- predict(xgb_model, dtest)
+  probs_train <- predict(xgb_model, dtrain)
+
+  res <- get_metrics_xgb(
+    probs_test, probs_train, y_test, y_train,
+    paste0(protease_name, "_XGB", suffix),
+    xgb_model,
+    balanced = balanced
+  )
+  res$feature_names <- keep_cols
+  res$train_medians <- train_medians
+  res
+}
+
+plot_xgb_results <- function(res, name = "XGBoost") {
+  roc_obj   <- pROC::roc(res$y_test, res$probs, quiet = TRUE)
+  roc_train <- pROC::roc(res$y_train, res$train_probs, quiet = TRUE)
+
+  p_roc <- ggplot2::ggplot() +
+    ggplot2::geom_line(
+      data = data.frame(f = 1 - roc_train$specificities, t = roc_train$sensitivities),
+      ggplot2::aes(x = f, y = t), color = "steelblue", alpha = 0.25, linewidth = 1
+    ) +
+    ggplot2::geom_line(
+      data = data.frame(f = 1 - roc_obj$specificities, t = roc_obj$sensitivities),
+      ggplot2::aes(x = f, y = t), color = "steelblue", linewidth = 0.9
+    ) +
+    ggplot2::geom_abline(slope = 1, linetype = "dashed", color = "grey50") +
+    ggplot2::annotate(
+      "text", x = 0.55, y = 0.15,
+      label = sprintf("Test AUC: %.3f\nTrain AUC: %.3f", res$auc, res$auc_train),
+      size = 3.2, hjust = 0
+    ) +
+    ggplot2::labs(title = paste(name, "ROC"), x = "FPR", y = "TPR") +
+    ggplot2::theme_bw()
+
+  pr_df <- data.frame(prob = res$probs, obs = res$y_test) %>%
+    dplyr::arrange(dplyr::desc(prob)) %>%
+    dplyr::mutate(tpr = cumsum(obs) / sum(obs), prec = cumsum(obs) / dplyr::row_number())
+  p_pr <- ggplot2::ggplot(pr_df, ggplot2::aes(x = tpr, y = prec)) +
+    ggplot2::geom_line(color = "#b2182b", linewidth = 0.9) +
+    ggplot2::annotate("text", x = 0.4, y = 0.2, label = sprintf("AUPRC: %.3f", res$prc), size = 3.2) +
+    ggplot2::labs(title = "Precision–Recall", x = "Recall", y = "Precision") +
+    ggplot2::theme_bw()
+
+  cm_test_df  <- as.data.frame(res$cm$table) %>% dplyr::mutate(Dataset = "TEST")
+  cm_train_df <- as.data.frame(res$cm_train$table) %>% dplyr::mutate(Dataset = "TRAIN")
+  cm_combined <- rbind(cm_train_df, cm_test_df)
+  cm_combined$Dataset <- factor(cm_combined$Dataset, levels = c("TRAIN", "TEST"))
+
+  p_cm <- ggplot2::ggplot(cm_combined, ggplot2::aes(Prediction, Reference, fill = Freq)) +
+    ggplot2::geom_tile() +
+    ggplot2::geom_text(ggplot2::aes(label = Freq), color = "white", fontface = "bold", size = 3) +
+    ggplot2::scale_fill_gradient(low = "#99ccff", high = "#003366") +
+    ggplot2::facet_wrap(~Dataset, ncol = 1, scales = "free_y") +
+    ggplot2::theme_minimal() +
+    ggplot2::theme(legend.position = "none", strip.text = ggplot2::element_text(face = "bold")) +
+    ggplot2::labs(title = "Confusion matrices")
+
+  all_labels <- c(pwm_labels, struct_labeller)
+  if (!is.null(res$importance) && nrow(res$importance) > 0) {
+    plot_imp <- res$importance %>%
+      dplyr::mutate(
+        Label = ifelse(Feature %in% names(all_labels), all_labels[Feature], as.character(Feature))
+      ) %>%
+      dplyr::slice_max(order_by = Gain, n = 10, with_ties = FALSE)
+    p_imp <- ggplot2::ggplot(plot_imp, ggplot2::aes(x = reorder(Label, Gain), y = Gain)) +
+      ggplot2::geom_col(fill = "steelblue") +
+      ggplot2::coord_flip() +
+      ggplot2::labs(title = "Top features (Gain)", x = NULL, y = "Gain") +
+      ggplot2::theme_bw()
+  } else {
+    p_imp <- ggplot2::ggplot() + ggplot2::theme_void() + ggplot2::labs(title = "No feature importance")
+  }
+
+  p_roc | p_pr | p_cm | p_imp
+}
+```
+
+### Train per-protease XGBoost models
+
+For each protease we load the raw / z / 0–1 cut-score tables, collapse identical 8-mer motifs among MEROPS sites, build a labeled feature matrix on MEROPS substrate proteins, and train an XGBoost model (plus a class-balanced counterpart for comparison).
+
+Unbalanced models correspond to the full cut-site landscape (Appendix S17–S18); balanced models use 1:1 sampling (Appendix S11–S12, S16). Figures show ROC, PR, confusion matrices, and top Gain features.
+
+```{r train-xgb, warning = FALSE}
+global_metrics <- data.frame()
+xgb_results <- list()
+protease_tables <- list()
+
+for (prot in proteases) {
+  message("==== ", prot, " ====")
+  tabs <- load_protease_tables(prot)
+  protease_tables[[prot]] <- tabs
+
+  df_model <- build_model_frame(tabs, df_cutsite)
+  feats <- get_feature_matrix(df_model)
+  message(sprintf(
+    "%s: %d sites, %d positives (%.2f%%), %d features",
+    prot, nrow(feats$X), sum(feats$y == 1), 100 * mean(feats$y == 1), ncol(feats$X)
+  ))
+
+  # Unbalanced
+  res_u <- run_xgb_pipeline(feats$X, feats$y, prot, balanced = FALSE)
+  save_fig(
+    plot_xgb_results(res_u, paste(prot, "XGBoost")),
+    paste0(gsub(" ", "_", prot), "_xgb_unbalanced"),
+    width = 14, height = 5
+  )
+
+  # Balanced 1:1 subsample
+  res_b <- run_xgb_pipeline(feats$X, feats$y, prot, balanced = TRUE)
+  save_fig(
+    plot_xgb_results(res_b, paste(prot, "XGBoost balanced")),
+    paste0(gsub(" ", "_", prot), "_xgb_balanced"),
+    width = 14, height = 5
+  )
+
+  xgb_results[[prot]] <- list(unbalanced = res_u, balanced = res_b, features = feats)
+}
+```
+
+### Performance summary
+
+Summarize train/test AUC, AUPRC, sensitivity, specificity, precision, and F1 across XGBoost runs:
+
+```{r metrics-summary}
+global_metrics2 <- global_metrics %>%
+  dplyr::mutate(
+    AUC = sprintf("Te: %.3f (Tr: %.3f)", Test_AUC, Train_AUC),
+    sensitivity = sprintf("Te: %.2f (Tr: %.2f)", Test_Sens, Train_Sens),
+    specificity = sprintf("Te: %.2f (Tr: %.2f)", Test_Spec, Train_Spec),
+    precision = sprintf("Te: %.2f (Tr: %.2f)", Test_Prec, Train_Prec),
+    F1_Score = sprintf("Te: %.2f (Tr: %.2f)", Test_F1, Train_F1),
+    PRC = sprintf("Te: %.3f (Tr: %.3f)", Test_PRC, Train_PRC),
+    PRC_fold = sprintf("Te: %.3f (Tr: %.3f)", Test_PRC_fold, Train_PRC_fold)
+  ) %>%
+  dplyr::select(Model, Timestamp, Balance, AUC, sensitivity, specificity, precision, F1_Score, PRC, PRC_fold)
+
+print(global_metrics2)
+write.csv(global_metrics, "global_model_performance_metrics.csv", row.names = FALSE)
+write.csv(global_metrics2, "global_model_performance_metrics2.csv", row.names = FALSE)
+```
+
+### Score full cut landscapes with trained models
+
+Apply each protease’s unbalanced XGBoost model to all sites on MEROPS substrate proteins for that protease, rebuilding features with the same `prep_model_df` joins used at train time (so column names stay aligned).
+
+Apply each unbalanced XGBoost model across that protease's scored landscape and export xgb_site_cleavage_probabilities.csv:
+
+```{r apply-xgb-scores, warning = FALSE}
+score_with_xgb <- function(prot, res, tables) {
+  feat_names <- res$feature_names
+  meds <- res$train_medians
+
+  df_merops <- dedupe_similar_sites(tables$merops)
+  df_raw_f <- tables$raw %>% dplyr::filter(uniprot %in% df_merops$uniprot)
+  df_model <- prep_model_df(df_raw_f, tables$z, tables$o1, df_cutsite, df_merops)
+
+  missing <- setdiff(feat_names, names(df_model))
+  if (length(missing) > 0) {
+    warning(prot, ": missing features filled with train median: ", paste(missing, collapse = ", "))
+    for (m in missing) df_model[[m]] <- NA_real_
+  }
+
+  X <- as.matrix(df_model[, feat_names, drop = FALSE])
+  X <- impute_median(X, meds[feat_names])
+  dmat <- xgboost::xgb.DMatrix(data = X)
+  probs <- predict(res$model, dmat)
+
+  dplyr::tibble(
+    uniprot = df_model$uniprot,
+    pos = df_model$pos,
+    protease = prot,
+    cleaved = df_model$cleaved,
+    cleavage_prob = probs
+  )
+}
+
+scored_list <- lapply(proteases, function(prot) {
+  score_with_xgb(prot, xgb_results[[prot]]$unbalanced, protease_tables[[prot]])
+})
+df_scored_all <- dplyr::bind_rows(scored_list)
+
+p_score_dist <- ggplot2::ggplot(df_scored_all, ggplot2::aes(x = cleavage_prob, fill = protease)) +
+  ggplot2::geom_density(alpha = 0.45) +
+  ggplot2::facet_wrap(~protease, ncol = 1, scales = "free_y") +
+  ggplot2::theme_bw() +
+  ggplot2::labs(
+    title = "XGBoost cleavage probabilities across scored sites",
+    x = "Predicted P(cleaved)",
+    y = "Density"
+  ) +
+  ggplot2::theme(legend.position = "none")
+save_fig(p_score_dist, "xgb_cleavage_prob_distributions", width = 8, height = 6)
+
+write.csv(df_scored_all, "xgb_site_cleavage_probabilities.csv", row.names = FALSE)
+```
